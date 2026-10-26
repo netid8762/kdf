@@ -31,18 +31,3 @@ jobs:
     uses: ./.github/workflows/build-windows.yml
     with:
       profile: release
-
-  ios:
-    uses: ./.github/workflows/build-ios.yml
-    with:
-      profile: release
-
-  android:
-    uses: ./.github/workflows/build-android.yml
-    with:
-      profile: release
-
-  wasm:
-    uses: ./.github/workflows/build-wasm.yml
-    with:
-      profile: dev
