@@ -38,21 +38,3 @@ jobs:
     with:
       profile: release
       features: "unsafe-rpc-wire-dump,unsafe-rpc-wire-dump-release-override"
-
-  ios:
-    uses: ./.github/workflows/build-ios.yml
-    with:
-      profile: release
-      features: "unsafe-rpc-wire-dump,unsafe-rpc-wire-dump-release-override"
-
-  android:
-    uses: ./.github/workflows/build-android.yml
-    with:
-      profile: release
-      features: "unsafe-rpc-wire-dump,unsafe-rpc-wire-dump-release-override"
-
-  wasm:
-    uses: ./.github/workflows/build-wasm.yml
-    with:
-      profile: dev
-      features: "unsafe-rpc-wire-dump,unsafe-rpc-wire-dump-release-override"
