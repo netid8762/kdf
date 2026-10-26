@@ -1,10 +1,7 @@
 name: Tests
 
 on:
-  push:
-    branches: [ reloaded-gplv2-base, dev, staging, main ]
-  pull_request:
-    branches: [ reloaded-gplv2-base, dev, staging, main ]
+  workflow_dispatch:
 
 permissions:
   contents: read
