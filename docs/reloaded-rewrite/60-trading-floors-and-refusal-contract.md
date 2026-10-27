@@ -188,6 +188,75 @@ by `max_taker_vol` / `max_maker_vol`, and nowhere else on the trading
 path. It is **not** consulted at order creation and **not** by a peer's
 order validation.
 
+**R60.4.5** *Balance watch for maker orders (passed the KDF Dirty Gate on
+2026-10-26; see §60.12).* The node watches a coin's balance only to keep its own maker
+orders' maximum volume honest.
+1. *Which coins.* A coin's balance is polled only while the node has at
+   least one maker order with that coin as base. The watch starts when the
+   first such order is created, seeded with the balance read at creation,
+   and stops when the last one is cancelled, matched away or expires. A
+   coin that is only activated, or only appears as rel, is not polled for
+   this purpose.
+2. *Interval.* The poll interval is the 30 s of R60.4.6 item 1, and no
+   shorter.
+3. *Work per poll.* A poll reads the balance only. The maximum maker volume,
+   and the fee preview it needs, are recomputed only when the balance
+   differs from the last value seen, and only if a maker order with that
+   base still exists.
+4. *Peer effect.* None beyond the existing R60.5.1 order updates, which are
+   sent only when an order's volume actually changes.
+
+*Rationale.* Each Electrum session is served about one request message per
+second once its burst is spent (chapter 38 R38.6.3a). Polling every
+activated coin every 10 s spends a fifth of a legacy-address coin's budget
+on balance reads that no maker order needs, and it competes with order
+posting on the same session.
+
+**R60.4.6** *Balance-watch interval and restored orders (closes D60.4;
+authored by the KDF Spec Reader 2026-10-27, passed the KDF Dirty Gate on 2026-10-27; see
+§60.12).* Every statement here holds identically at `v2.6.0-beta` and
+`v3.0.0-beta`.
+
+1. *Interval.* The watch of R60.4.5 sleeps **30 seconds** between polls.
+   The value is fixed in the build: it is not read from the daemon
+   configuration and no operator override exists. The sleep comes first,
+   so a watch started at time *t* performs its first balance read at
+   *t* + 30 s. (D60.4's own lower bound of 10 s is met with margin.)
+2. *Failed poll.* A poll whose balance read fails changes nothing: the
+   last-seen value is kept, no recomputation runs, no order is touched,
+   and the next poll follows after the ordinary interval.
+3. *Seed at creation.* A watch started by maker-order creation is seeded
+   with the balance the creation itself read while checking the order
+   (R60.4.5 item 1); its first poll recomputes only if the balance has
+   moved since.
+4. *Restored and converted orders are unseeded.* A maker order restored
+   from storage at node start, and a maker order produced by converting a
+   timed-out taker order (chapter 59 R59.4.1), start the watch for their
+   base coin — if none is running — **without** a seed: no balance is
+   read at insertion. The watch's first poll, 30 s later, treats the
+   value it reads as a change and runs the recomputation of R60.4.5
+   item 3 once; where the balance has not changed since the reconciliation of item 5
+   (restored orders) or since the order was sized (converted orders), that
+   recomputation finds nothing to lower, so it changes no order and sends
+   nothing; this follows from the reconciliation having run and is not a
+   separately observed behavior. From then on the watch behaves as for any
+   other order.
+5. *Fresh read on re-announcement.* Independently of the watch, when the
+   periodic order-matching maintenance finds one of the node's own maker
+   orders absent from the local orderbook — the state of every restored
+   order on the first maintenance pass after start, and of every order
+   under a public key evicted by chapter 59 R59.6.4 — it reads the base
+   coin's spendable balance afresh and recomputes the maximum maker
+   volume for it; lowers the order's maximum volume to its reserved
+   amount plus that maximum when the maximum is below the order's
+   available amount (it never raises it); cancels the order with the
+   insufficient-balance reason when the read or the recomputation fails,
+   or when the available amount is then below the order's minimum
+   volume; and otherwise re-announces the order (chapter 59 R59.6.7). A
+   restored order is thus reconciled with the live balance on the first
+   maintenance pass, before the watch's first poll. This path is
+   baseline behavior (V60.2); items 1–4 are post-baseline.
+
 ## 60.5 Refusal and failure map — what a peer observes
 
 This section answers whether a floor is a wire parameter. It is, in two
@@ -430,6 +499,19 @@ coin layer (§60.5 R60.5.6 rows 3–5 and 8, findings F1 and F2).
    coin shall be at least the base coin's `S`, and that volume times the
    order's price at least the rel coin's `S`, for each leg whose coin is
    covered.
+
+   **Amendment (Reloaded-original, maintainer Decision P of 2026-10-27; passed the KDF Dirty Gate on 2026-10-27).**
+   Item 3 applies when an order is created (`setprice`, `buy`, `sell`)
+   and in `trade_preimage`. On `update_maker_order` it applies only when
+   the update changes the order's volume (a volume delta, or `max`). An
+   update that changes only the price, the minimum volume or the
+   confirmation settings is not re-checked. *Accepted cost:* such an update
+   can leave the smallest trade below `S` without a refusal, in the same way
+   as item 5's long-lived order whose fees rose after it was placed.
+   *Rationale:* a price-only update needs no server call otherwise. Each
+   Electrum session is served about one request message per second once its
+   burst is spent (chapter 38 R38.6.3a), so every fee-rate read the check
+   adds costs a market maker about a second per update.
 4. *Refusal.* A request that fails item 3 is refused with the same typed
    volume-too-low refusal the floors produce (R60.4.2), naming the coin
    and carrying `S` as the threshold; `trade_preimage` reports the same
@@ -455,6 +537,11 @@ coin layer (§60.5 R60.5.6 rows 3–5 and 8, findings F1 and F2).
    > **Compatibility:** for behaviour matching GLEEC KDF, set
    > `pre_trade_spend_check` to `false`. GLEEC KDF has no such check: it
    > accepts these orders, and the swap then fails in the coin layer.
+
+8. *Fee-rate reuse (Reloaded-original, Decision P; passed the KDF Dirty Gate on 2026-10-27).* Where the
+   check reads a coin's current fee rate, that same reading is used by the
+   trade-fee calculation of the same request. A request reads each coin's
+   fee rate at most once (chapter 38 R38.6.6j, chapter 57 R57.2.6).
 
 > **As-built note (2026-10-25, clean-side record).** R60.6.4 and R60.6.7
 > are implemented in PR #73, together with T60.5 and T60.6. The UTXO
@@ -509,6 +596,24 @@ floor of 0.0001 is accepted (`S` = 496 + 1,000 base units);
 accepted; (f) an incoming order or taker request below `S` is handled
 exactly as without the rule.
 
+**T60.7** *R60.4.6.* (a) With one maker order on base coin X and a
+balance that does not change, exactly one balance read of X occurs per
+30 s and none within the first 30 s after the watch starts; the interval
+is unaffected by any configuration member. (b) A watch seeded at
+creation with balance *b* performs no recomputation on a first poll
+reading *b*, and exactly one on a first poll reading *b′* ≠ *b*. (c)
+After a restart with one stored maker order, the first maintenance pass
+reads the balance once and re-announces the order; the watch's first
+poll at +30 s runs one recomputation even though the balance equals the
+pass's reading, and that recomputation changes no order and sends no
+message. (d) A poll whose read fails leaves the last-seen value and
+every order untouched, and the next poll occurs 30 s later. (e) A
+restored order whose live balance supports less than its available
+amount is announced with its maximum volume lowered to the reserved
+amount plus the supported maximum; one whose supported maximum is below
+its minimum volume is canceled with the insufficient-balance reason and
+not announced.
+
 ## 60.8 Deferred Work
 
 **D60.1** *Finding F1 remedy* — **resolved 2026-10-25.** The maintainer
@@ -524,6 +629,15 @@ below the miner fee from being created.
 coin-agnostic and is now bound here as R60.4.2 step 4; the one-line fix
 itself remains tracked by chapter 57 D7 and the parity tracker's #12.
 
+**D60.4** *Balance-watch interval and restored orders* — **resolved
+2026-10-27** (passed the KDF Dirty Gate on 2026-10-27). Both open points are bound by
+R60.4.6: the parity interval (item 1) and the start and seeding of the
+watch for restored orders (items 4 and 5). This project's own budget
+arithmetic — one request message per poll (chapter 38 R38.6.3a), a
+budget of about one message per second, polling kept under a tenth of a
+session's budget — gives a lower bound of 10 s per watched coin, which
+the bound value satisfies.
+
 ## 60.9 Baseline Verifications
 
 - **V60.1** The tree at the baseline anchor (R1) carries: the UTXO floor as ten dust
@@ -534,6 +648,13 @@ itself remains tracked by chapter 57 D7 and the parity tracker's #12.
   value; the order-builder arithmetic of R60.4.2 steps 1–3 with a 10^-8
   price floor. Reloaded inherits all of these except where chapter 38's
   as-built note records a change.
+- **V60.2** The tree at the baseline anchor (R1) carries the
+  re-announcement path of R60.4.6 item 5 — fresh balance read, downward
+  volume reconciliation, insufficient-balance cancellation — for own
+  maker orders absent from the local orderbook, and carries **no**
+  per-base-coin balance watch: no poll interval, no watch started at
+  order creation, no seed. R60.4.5 and R60.4.6 items 1–4 are therefore
+  post-baseline on both sides.
 
 ## 60.10 External References
 
@@ -775,3 +896,50 @@ itself remains tracked by chapter 57 D7 and the parity tracker's #12.
   2 × 10^19 hastings, and one SC is 10^24 hastings, so the fee is
   0.00002 SC. The figures now say so. The finding stands, at that size.
   This correction uses no forbidden-class input.
+- *Addition of 2026-10-26, cleared by the KDF Dirty Gate.* R60.4.5 and D60.4 were
+  written by a session that never read the corpus. Its rationale comes from
+  this project's own Electrum measurements and code reading. Before writing
+  them, that session had received a KDF Spec Reader's behavioural summary of
+  the reference, relayed before any gate pass, and items 1 and 3 coincide
+  with it, so its provenance is recorded here rather than claimed as
+  clean-room-original. No value from that summary is stated.
+  *Dirty Gate clearance (chapter 01 T1, R40).* PASS on 2026-10-26, measure
+  0.03, no leaks, with the pre-gate summary declared as an input. *Extent:*
+  the maker-order balance-watch surface of the order-matching subsystem
+  within the scope of §60.4, at `v2.6.0-beta` and `v3.0.0-beta`. *Method:*
+  reading plus mechanical text search for identifiers, phrases and figures;
+  the gate script was not run because there are no code blocks. *Measure:*
+  0.03 against the 0.10 threshold. The gate confirmed that the 10 s lower
+  bound in D60.4 is this project's own arithmetic, and that the rationale
+  is independent of the reference.
+- *Reloaded-original additions (2026-10-27), cleared by the KDF Dirty Gate.* The R60.6.7 amendment and item 8 were
+  written by a session that never read the corpus, from the maintainer's
+  Decisions P and R of 2026-10-27 and this project's own Electrum measurements and code reading. The informative notes saying
+  the reference reads its fee estimate or gas price per consumer and caches
+  nothing rest on a KDF Spec Reader summary relayed before its gate pass, and
+  are declared here as that input. *Dirty Gate clearance (chapter 01 T1,
+  R40).* PASS on 2026-10-27, measure 0.00, no leaks; the declared input
+  was verified accurate at both rows, and the switch names do not occur in the
+  reference. *Extent:* the fee-rate acquisition surface used by the pre-trade check and the trade-fee consumers of §60.6, at `v2.6.0-beta` and `v3.0.0-beta`.
+  *Method:* reading plus mechanical text search against both rows; the gate
+  script was not run because there are no code blocks. *Measure:* 0.00
+  against the 0.10 threshold.
+- *Addition of 2026-10-27 (KDF Spec Reader; passed the KDF Dirty Gate on 2026-10-27).*
+  R60.4.6, T60.7, V60.2, the resolution of D60.4 and the pointer change
+  in R60.4.5 item 2 were authored by the KDF Spec Reader under the
+  two-team procedure of chapter 01 §1.4A. Forbidden-class input,
+  consulted at the rows `v2.6.0-beta` and `v3.0.0-beta` of chapter 02
+  §2.15A (identical for everything stated) and compared with the baseline
+  anchor (V60.2): the fixed 30 s interval and its non-configurability;
+  the sleep-before-read ordering; the behavior on a failed read; which
+  insertion paths seed the watch and which do not; and the
+  fresh-read-and-reconcile behavior of the re-announcement path. Every
+  fact is stated as externally observable behavior; no private
+  identifier, function body, helper decomposition, log or error literal
+  was reproduced. Dirty Gate clearance (chapter 01 T1, R40): PASS, measure 0.02, no leaks;
+  every reference fact confirmed at both rows. *Extent:* the order-matching
+  balance-watch and re-announcement surface, one file per row and the
+  baseline, with the row-to-row difference. *Method:* reading plus a
+  mechanical regex scan of every added line against private identifiers,
+  literals and distinctive phrases; the mechanical gate tool was not run
+  (prose). *Measure:* 0.02 against the 0.10 threshold.

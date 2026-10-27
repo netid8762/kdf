@@ -51,6 +51,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- **A cancelled order's identifier is no longer ignored once its two-minute window is over.** A node remembers for 120 seconds that a peer cancelled an order and ignores a late announcement of the same order during that time. The check did not look at the age of the memory, so an old entry could keep ignoring the same order after the window, until the next cancellation cleared it. The check now treats an entry older than the window as absent. Orders get random identifiers, so this was very unlikely to matter in practice. Detail: PR #102; CRD ch.11 R10.
+
+- **An unresponsive EVM node is given up after 10 seconds instead of 60.** The limit now covers the
+  whole attempt, from connecting to the last byte of the answer, on every platform, so a slow node no
+  longer holds a request for a minute before the next node is tried. A request given up on is now
+  closed too, instead of staying open in the background for as long as the node keeps silent. More in
+  ch.35 §35.1.F.
+
+- **EVM and Tron log lines and errors name a node by scheme, host and port only.** Paths, query
+  strings and credentials, where hosted providers keep API keys, are never printed: the activation
+  probe, the per-node failure logs, the error that lists the nodes tried, and the lower-layer texts
+  they carry. When a node answers with an error, the log says so
+  (`EVM RPC <host> answered <method> with error <code>: <message>`) and the error returned to the
+  caller ends with `(node <host>)`, so a revert reported by one of several nodes can be attributed.
+  The same goes for the gas-station URL and the gas-API provider (Infura, Blocknative) URL, which
+  also carry API keys. There is no switch to print the full URL. More in ch.35 §35.1.F.
+- **TRON (TRX, TRC20) cannot be activated in this beta.** Its support is not finished; activation
+  answers "TRON support is not available in this build" instead, and the rest of the node is
+  unaffected. It is planned to return in the next beta.
+
+- **Solana (SOL, SPL tokens) cannot be activated in this beta.** Its support is not finished;
+  `enable_solana_with_tokens` and `enable_spl` answer "Solana support is not available in this
+  build" instead, and the rest of the node is unaffected. It is planned to return in the next beta.
+
+- **Tendermint (Cosmos) coins are wallet-only in this beta.** Activation, balances and withdrawals
+  work; orders and swaps are not available and are planned to return in a later release. A swap
+  already in progress still completes. An order with a Tendermint coin saved by an earlier
+  version is cancelled at startup.
+
 - **A shielded (ARRR) send that has to wait for an earlier unmined send now waits up to 10 minutes
   instead of 5, retrying every 15 seconds, as GLEEC KDF does.** The wait still ends at once when no
   waiting could free enough funds. More in
@@ -149,6 +178,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   configuration). Detail: PR #64.
 
 ### Fixed
+
+- **A maker node that is not a relay now keeps its order book of other makers up to date after a restart.** After a restart the node announced its stored orders again, but it did not record that it was following their trading pairs, so a keep-alive from another maker with a different order list never made it ask for that maker's orders, and its view of the other makers on its own pairs went stale until something else (an order book request, a new order on the pair) recorded the pair. Re-announcing a stored order now records the pair first, without requesting the order book. Detail: PR #101; CRD ch.59 R59.6.7.
+
+- **Gossip message ids now use the compact 8-byte form other KDF nodes use, which should cut the bandwidth a relay spends on duplicate messages.** Our nodes announced each message with an id written as decimal text, while the other implementations write the same 64-bit value as 8 raw bytes, so an id announced by one side never matched the id the other side already held and every announced message was requested again, then dropped as a duplicate. The id is now the 8-byte big-endian form; what it is computed from is unchanged. Nodes on the old and new encoding still exchange messages normally, but each message is sent once more between them until both sides are upgraded. Detail: PR #99; CRD ch.28 R13.
+- **A maker no longer advertises or serves a just-cancelled or just-repriced order from stale data.** For a few milliseconds after a cancel or a price change, the node's order index was already up to date while the data behind its keep-alive messages and its answers to other nodes' sync requests was not, so it could still announce the old state, and a node that had already seen the cancel could log "recently cancelled" when the old order was listed again. Keep-alives and sync answers are now built only once both are up to date: a keep-alive is skipped for that round and a sync request gets a "retry" answer instead. Detail: PR #98; CRD ch.32 R-T3b.
+
+- **A maker order for a shielded-coin pair (such as ARRR) no longer drops out of the maker's own order book every minute and a half and gets announced again.** Orders for those pairs are placed under a separate key of their own, and the cleanup that forgets silent peers treated that key as a silent peer, because the node never hears its own keep-alive back. The cleanup now leaves the node's own keys alone, so these orders stay put and the extra announcements stop. Detail: PR #94; CRD ch.59 R59.6.5.
+
+- **An EVM node that answers with an error no longer ends the request; the next configured node is
+  tried.** Before, the first node's answer was accepted even when it carried an error object, such as
+  "block range too large" or a revert, so one picky node failed the call although the others could
+  serve it. Now the nodes are tried one at a time, a refusing node counts as a failed node, and the
+  node that finally answers is tried first the next time. When every node fails, the caller gets the
+  last node's own error. More in ch.35 §35.1.F.
+
+- **A swap or withdraw on an EVM coin no longer waits for all nodes to agree on the nonce.** One
+  lagging node used to hold the transaction indefinitely. Now the highest pending nonce wins and the
+  signed transaction is sent at once to every node that reported it; the send succeeds as soon as one
+  of them accepts it. A transaction you broadcast yourself with `send_raw_transaction` is tried node
+  by node instead. More in ch.35 §35.1.F.
+- **The legacy `electrum` method now honors `min_connected` and `max_connected`.** Before, both were
+  ignored and every listed server was connected; with `max_connected: 1` only one server is connected
+  now, and unusable values (zero, a minimum above the maximum, a wrong type, an empty server list) are
+  refused with the usual error answer, as on the newer activation methods. This also applies to BCH
+  and QRC20 activated through `electrum`. More in ch.55 R55.4.3 and ch.38 R38.6.4.
 
 - **Reading the order book of a pair that includes an ARRR order no longer fails on the older `orderbook` method.**
   Before, one ARRR order on the book made the whole older `orderbook` request fail with an internal
@@ -349,9 +403,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   protocol defines it. Balances, history, deposits and plain withdrawals were never affected. Detail:
   PR #55; CRD ch.37 R37.5.2, R37.5.4.
 
+- **A node no longer keeps memory for every swap it has ever run, and stopping it no longer waits for the swap bookkeeping.** Each finished swap left a small record behind for as long as the node ran (about 3 KB for a maker or taker swap in total), so a node that runs many swaps grew slowly without bound. The record of a running swap is now dropped as soon as the swap ends, on every way it can end, together with the messages kept for it. When the node is told to stop, it clears this list at once instead of waiting for it to empty. Detail: PR #100; CRD ch.51 R58A, R58B.
+
 ### Plans touched
 
 Plans this cycle moved, in any sense; each plan file carries the detail.
+
+- [`solana-support`](docs/plans/solana-support.md), [`tron-swap-support`](docs/plans/tron-swap-support.md),
+  [`tron-gasfree`](docs/plans/tron-gasfree.md),
+  [`tendermint-activation-features`](docs/plans/tendermint-activation-features.md) and
+  [`trading-floors-parity`](docs/plans/trading-floors-parity.md) — each notes that its family is
+  switched off (TRON, Solana) or wallet-only (Tendermint) for this beta, and that turning it back on
+  belongs to the family's plan.
 
 - [`shielded-in-flight-note-locking`](docs/plans/shielded-in-flight-note-locking.md) — the
   withdraw path now records the transaction when the client submits it, and the plan moved to in progress (PR #49); the shortfall it causes is now named (PR #50). The test harness for the locked-notes check landed
@@ -388,6 +451,9 @@ Plans this cycle moved, in any sense; each plan file carries the detail.
 - [`sia-withdraw-fee-control`](docs/plans/sia-withdraw-fee-control.md) — moved from parked to done:
   a Siacoin `withdraw` now honors a custom fee (PR #77), and a fee below the node's estimate was
   checked live on an uncongested transaction pool (2026-10-26).
+- [`order-posting-latency`](docs/plans/order-posting-latency.md) — opened: order posting is slowed by
+  the Electrum servers' per-session limit of about one request per second. The rules for batching,
+  fee reuse, read spreading and balance polling are written (PR #95).
 
 ### Known limitations
 
@@ -410,6 +476,13 @@ lives.
   signs, but swaps with it are not established. The swap watcher, which finishes a swap for you when
   you are offline, does not work yet (issue #56). More in
   [`rxd-signature-version-support`](docs/plans/rxd-signature-version-support.md).
+- **TRON (TRX, TRC20) and Solana (SOL, SPL) cannot be activated in this beta.** Their support is not
+  finished, so activation answers a clear error instead. Both are planned to return in the next beta.
+  More in [`tron-swap-support`](docs/plans/tron-swap-support.md) and
+  [`solana-support`](docs/plans/solana-support.md).
+- **Tendermint (Cosmos) coins are wallet-only in this beta.** Activation, balances and withdrawals
+  work; orders and swaps are planned to return in a later release. More in
+  [`tendermint-activation-features`](docs/plans/tendermint-activation-features.md).
 
 ## [0.3.0-alpha.3] — development milestone, not released
 
