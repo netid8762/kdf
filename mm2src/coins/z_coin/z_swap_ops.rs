@@ -1,5 +1,6 @@
 use super::*;
-use crate::z_coin::z_tx_read;
+use crate::z_coin::{z_refund_gate, z_tx_read};
+use crate::CanRefundHtlc;
 use crate::HtlcPaymentCheck;
 
 #[async_trait]
@@ -389,6 +390,12 @@ impl SwapOps for ZCoin {
         )
     }
 
+    fn htlc_key_is_random_per_swap(&self) -> bool { true }
+
+    async fn ensure_own_payment_watchable(&self) -> Result<(), String> {
+        z_tx_read::ensure_own_payment_watchable(self).await
+    }
+
     fn extract_secret(&self, secret_hash: &[u8], spend_tx: &[u8]) -> Result<Vec<u8>, String> {
         z_tx_read::extract_secret(secret_hash, spend_tx)
     }
@@ -401,6 +408,25 @@ impl SwapOps for ZCoin {
     }
 
     fn get_htlc_key_pair(&self) -> Option<KeyPair> { Some(KeyPair::random_compressed()) }
+
+    /// R39.5.13: the refund waits until the wall clock and the chain's median time past have both passed
+    /// the lock time, and a read failure is an error the refund stage retries after 30 seconds.
+    fn can_refund_htlc(&self, locktime: u64) -> Box<dyn Future<Item = CanRefundHtlc, Error = String> + Send + '_> {
+        let fut = async move { Ok(z_refund_gate::refund_gate(self, locktime).await?.into_can_refund()) };
+        Box::new(fut.boxed().compat())
+    }
+
+    fn retriable_refund_rejection(&self, rejection: &str) -> Option<String> {
+        z_refund_gate::non_final_rejection(rejection)
+    }
+
+    fn refund_gate_closed_note(
+        &self,
+        locktime: u64,
+    ) -> Box<dyn Future<Item = Option<String>, Error = String> + Send + '_> {
+        let fut = async move { Ok(z_refund_gate::refund_gate(self, locktime).await?.closed_note(locktime)) };
+        Box::new(fut.boxed().compat())
+    }
 }
 
 #[async_trait]

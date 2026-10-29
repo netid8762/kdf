@@ -590,7 +590,11 @@ events as separate single-event batches.
    while the worker lagged; that outcome is withdrawn.)*
 3. *Nobody else waits.* The producer of an index operation MUST NOT wait for
    the worker, and no wait of item 2 may happen on the inbound networking
-   path (R-T7).
+   path (R-T7). *(Amended 2026-10-28, Decision AN, Reloaded-original.)* A
+   synchronization request parked under §32.7.3 R-Q5b is not a wait on that
+   path: the inbound handler hands the request's response channel over to
+   the parked entry and returns at once; the answer is built and sent later
+   from another task.
 4. *The keep-alive receiver compares with a caught-up store.*
    *Reloaded-original (2026-10-28).* The comparison of an advertised root
    with the root this node holds (§32.7.3 R-Q4 steps 3 and 4) MUST use a
@@ -888,6 +892,62 @@ by its worker). A requester logs all three as a request error and retries
 none (R-Q6). Reloaded's responder and applier behave the same:
 **parity**.
 
+**R-Q5b (Reloaded: a pair still being synchronized is answered when its
+synchronization lands).** *Reloaded-original (2026-10-28, Decision AN); no
+forbidden-class input.* A relay forwards a keep-alive at the gossip layer
+before it handles it (§32.8 R-F3a), so its downstream peers ask it while its
+own request for the same pair is still in flight, and R-Q5a's
+placeholder-root failure is their certain outcome. To serve them instead,
+Reloaded's responder MUST treat a `SyncPubkeyOrderbookState { pubkey: P,
+trie_roots }` request as **deferrable** when, for every requested pair, the
+responder holds a root for (P, pair) and, for every requested pair whose held
+root is the all-zero placeholder, the responder's **own** keep-alive-driven
+synchronization request for (P, pair) is in flight. An own request is in
+flight from the moment it is sent until its answer's mutation events have
+been applied by the trie worker, or until it fails; the wait for the worker
+after a successful answer lasts at most the bound of item 3, so no record
+outlives the longest parked request.
+
+1. A deferrable request is **parked**. It waits for the own requests that
+   are in flight when it arrives (a later own request for the same pair does
+   not extend the wait). It is answered as soon as every own
+   request it waits for has completed, or when its bound expires, whichever
+   comes first. The answer is the one R-Q5 gives at that moment — the same
+   outcomes, all-or-nothing as before. If an own request it waits for failed,
+   or the bound expired, the requester receives the error it would have
+   received at once.
+2. A request that is not deferrable is answered at once, as R-Q5 binds:
+   an unknown pubkey ("no data"), a missing pair, or a placeholder for which
+   no own request is in flight.
+3. The **bound** is the top-level `MM2.json` integer
+   `sync_answer_deferral_ms`, default `5000` (5 s), counted from the
+   request's arrival. It MUST stay well below the requester's 10 s timeout
+   (R-Q6); a bound at or above that timeout gains nothing, because the
+   transport abandons the request first. The value `0` turns deferral off:
+   every request is answered at once, as in the reference.
+4. **Limits.** At most 8 requests are parked per requesting peer and at most
+   256 in total, a request counting once whatever the number of pairs it
+   names; a request past either limit is answered at once. The per-peer
+   limit MUST stay below the number of concurrent inbound streams the
+   transport allows on one connection, because a parked request holds its
+   stream open.
+5. Parking does not wait on the inbound networking path (R-T3b item 3). It is
+   the one case in which the answer is not built on the task that received
+   the request (R-Q5's last paragraph).
+
+> **Compatibility:** for behaviour matching GLEEC KDF, set
+> `sync_answer_deferral_ms` to `0`.
+
+> **Reloaded divergence (2026-10-28).** The reference answers every request
+> at once. Against a relay that has just forwarded a keep-alive and is still
+> synchronizing the pair, its subscribers fail, ask again only at the next
+> keep-alive (R-Q6), and so wait one advertisement interval (30 s) per relay
+> hop. Under this rule a Reloaded relay answers them within the bound, and on
+> a relay they forward on success (R-F3b), so the next hop is served in the
+> same round. The answer and its shape are unchanged; only its timing
+> differs, and only for a request that would otherwise fail. Reference and
+> Reloaded requesters alike accept a late answer within their timeout. Implemented 2026-10-28.
+
 **R-Q6 (transport properties of the request, bound as facts the mesh
 relies on).** The request is a single one-shot request-response
 exchange with F: it times out after **10 seconds** with no answer; there
@@ -900,7 +960,8 @@ What the requester does with each outcome is bound by §32.8 R-F3b
 (its gossip-layer forward, on a relay, has already happened: R-F3a).
 Reloaded today has the same four properties (parity); the hardening
 candidates that would change them are recorded under §32.10 D6 and
-are not bound here.
+are not bound here. As a responder, Reloaded answers a request for a pair
+it is still synchronizing later rather than at once (R-Q5b).
 
 **T-Q4** *Request content and target (R-Q4).* A keep-alive for P with a
 single pair entry whose root differs from the held one, delivered as if
@@ -936,6 +997,23 @@ empty-trie root, and a following request for (P, Y) yields an empty full
 snapshot. A keep-alive handled on a non-relay for a pubkey never seen
 creates the record even when no advertised pair is in its recorded
 subscriptions.
+
+**T-Q5b** *A pair still being synchronized is answered when its
+synchronization lands (R-Q5b).* A relay holds the all-zero placeholder for
+(P, X) and has its own request for (P, X) in flight. A request for (P, X) is
+parked and the inbound handler returns without waiting; once the relay's own
+answer is applied, the parked request is answered with the full set, well
+within the bound. The same with the relay's own request failing: the parked
+request receives the placeholder error, within the bound. With the relay's own
+request never answering: the parked request receives the placeholder error
+when the bound expires. A request for (P, Y) whose placeholder has no own
+request in flight, a request naming a pair the relay does not track, and a
+request for an unknown pubkey are each answered at once, as R-Q5 binds; a
+request for (P, X) and (P, Y) together is answered at once with the
+placeholder error. Past 8 parked requests from one peer, or 256 in all, a
+further request is answered at once. With `sync_answer_deferral_ms` set to
+`0`, every request is answered at once. After every path the parked table is
+empty.
 
 **T-Q6** *No retry, no de-duplication (R-Q6).* With the responder
 silenced, one keep-alive produces exactly one request and nothing more
@@ -1486,6 +1564,43 @@ today (ch. 59 R59.6.5), so this subsystem can currently evict a
 pubkey the node itself makes orders under and drop those orders
 from its own read index.
 
+**R-K4 (memory maintenance of the synchronization state; Reloaded-original,
+2026-10-28).** The delta history of R-P5 and R-T4 and the node store of R-T1
+stay as they are on the wire and in their answers. What this rule adds is that
+the memory they hold is released when it is due, not only when traffic happens
+to touch it, and that nothing leaks when a slice is cleared:
+
+1. *Expiry on a timer.* Every 30 seconds, independently of any traffic, each
+   pubkey state drops the expired entries of its per-pair history cache (the
+   4-hour bound) and of each pair's delta history (the 5-minute bound), and
+   releases the spare capacity of those tables. Which entries are expired does
+   not change: an entry whose expiry was refreshed is not dropped, and a delta
+   answer for a root inside its window is unchanged by a sweep. A pair's history
+   is removed only by its own 4-hour bound, never because its deltas expired.
+2. *Refreshing an expiry is free.* Refreshing a cache entry's expiry does not
+   add bookkeeping: each key has one expiry-queue element, and a queue element
+   whose entry was refreshed is re-queued at its true expiry when it is reached.
+3. *Node store.* After each ten-minute purge the node store releases the spare
+   capacity of its table. Where the allocator keeps freed pages in the
+   process (glibc), the node also asks it to return them to the system, outside
+   every lock, and logs the resident size before and after at debug level.
+4. *Clearing releases nodes.* Clearing a `(pubkey, pair)` slice, and removing a
+   pubkey, dereferences the nodes of the cleared tries, so that the purge
+   reclaims them. A node still referenced by another trie stays (the store
+   counts references). This adopts the "orphan release" candidate of D6.
+5. *Gauges.* The node reports, besides `orderbook.len`, the number of pair
+   histories and of stored deltas, the number of tracked pubkeys and the number
+   of queued trie-operation batches not yet applied (`orderbook.history.pairs`,
+   `orderbook.history.deltas`, `orderbook.pubkeys`, `orderbook.trie_ops.pending`),
+   on every sweep; and the size in bytes and entry count of the node store
+   (`orderbook.memory_db`, `orderbook.memory_db.entries`), right after each
+   purge only, because measuring the store walks all of it while the store is
+   locked.
+
+No item changes a wire shape. The tests are those of the implementing change
+(in-process counts and capacities after a burst, the timer sweep, the clear and
+the shared-subtree case, the gauges).
+
 ## 32.9A Bounded and Unbounded State
 
 *(Authored by the KDF Spec Reader 2026-10-28, second pass, from the rows
@@ -1535,6 +1650,10 @@ bound (**parity**); the Reloaded-original candidates that would add one
 are recorded under §32.10 D6 and ch. 28 D7 and are not bound here.
 Adopting any of them is a divergence to record in the operator-facing
 compatibility documents; none changes a wire shape.
+Since R-K4 (item 4) the cleared-slice part of row 6 is no longer
+parity: Reloaded releases the nodes of a cleared slice, and row 3 and
+the nodes of replaced leaves are released on a timer (R-K4 items 1 and
+3).
 
 **R-B3 (two growth modes an operator can tell apart).** Rows 6 and 7
 grow with what *this* node applies: every synchronization answer in the
@@ -1552,7 +1671,8 @@ full snapshots for one (pubkey, pair), each listing the same two orders;
 the node store grows by about N times the size of one two-leaf trie and
 does not shrink after the ten-minute purge. Applying N successive deltas
 instead grows it by at most the size of the live trie plus the nodes the
-next purge releases.
+next purge releases. *(Reloaded, since R-K4 item 4: after the purge the
+node store is back to the live trie in both cases.)*
 
 **T-B2** *Slow peer (R-B1 row 17).* A relay forwarding a steady message
 stream to a peer whose inbound is throttled accumulates queued outbound
@@ -1564,6 +1684,315 @@ unaffected.
 keep-alives advertising a root the node cannot synchronize (every
 request fails) keeps its record and placeholders for as long as the
 keep-alives arrive, and loses them 90 s after they stop.
+
+## 32.9B Maker Publication Rate (Reloaded-original)
+
+*Reloaded-original (maintainer decision AO, option C, 2026-10-28); no forbidden-class
+input. The plan behind it is `docs/plans/maker-gossip-rate-control.md`.*
+
+**R-MP1 (maker outbox).** The order messages a node publishes for its own
+maker orders go through one *outbox* per maker pubkey: the persistent one
+and each per-order one. These are the maker-order created, updated and
+cancelled messages, including the re-announcement of an own order missing
+from the index ([Chapter 59](59-legacy-ordermatch-negotiation.md) R59.6.7).
+
+1. **One pending message per order.** The outbox holds at most one pending
+   message per order uuid. A new message for an order that already has one
+   pending merges with it:
+
+   | Pending | New | Result |
+   |---|---|---|
+   | none | any | the new message |
+   | created | updated | created, carrying the updated values |
+   | updated | updated | updated, field by field: each field takes its latest value set in either message |
+   | created or updated | cancelled | cancelled; the pending message is discarded |
+   | cancelled | any | cancelled; a cancellation is terminal and never merged away |
+
+2. **Not held back:**
+   - A cancelled message is published at once and is not counted against
+     the budget of R-MP2.
+   - The swap-negotiation messages (taker request, maker reserved, taker
+     connect, maker connected) do not go through the outbox at all.
+   - Both are published with **priority** under
+     [Chapter 28](28-libp2p-modernization.md) §28.9B RQ1 item 9, both when
+     the node publishes them and when it lets a received one propagate.
+   - No other ordermatch message is priority. Keep-alives in particular
+     are not (R-MP3 item 3).
+   - A cancellation that overtakes an earlier message for the same order
+     is safe: the receiver's cancellation guard (§32.3 R-C5, §32.9 R-K1)
+     suppresses a creation that arrives after it, and an update for an
+     order the receiver no longer holds is ignored.
+3. **Local state is not delayed.** The maker's own order record, its trie
+   ([§32.6](#326-patricia-trie-substrate-and-delta-sync)) and the result
+   of the request that changed the order are updated at once, as without
+   the outbox. Only the gossip message waits.
+4. **Order of release.** Pending messages are released oldest first,
+   counted from when the order's slot was first filled, so that no order
+   waits behind newer ones.
+5. **Switch.** The top-level `MM2.json` boolean `maker_update_coalescing`
+   (default `true`) selects this rule. Only a JSON `false` turns it off,
+   and every message is then published at once, as without the outbox.
+
+**R-MP2 (release budget).** The outbox releases created and updated
+messages at no more than the pubkey's current *rate*.
+
+1. **Ceiling.** The rate never exceeds `maker_update_rate_max` messages
+   per second per maker pubkey (top-level `MM2.json` number, default 10),
+   with a burst of 10 × that value (default 100).
+2. **Signals** *(amended 2026-10-28, decision AO direction (a)).* Two
+   signals, each judged for every connection to a relay, tell the node
+   that a relay is not keeping up:
+   - *Queue signal.* It is raised while the data queue of
+     [Chapter 28](28-libp2p-modernization.md) §28.9B RQ1 toward the relay
+     has held at least one data RPC for 2 seconds without becoming empty,
+     or while the pressure level of RQ1 item 8 is raised. It clears once
+     that queue has been empty for 5 seconds and the level of item 8 is
+     cleared. It catches a relay that reads slowly while the connection
+     stays up: the backlog then sits in that queue.
+   - *Close signal.* It occurs when the node's last connection to a relay
+     closes while an outbox holds a pending created or updated message, or
+     has released one within the preceding 30 seconds. It catches a relay
+     that stops reading: the backlog then sits below the queue, in the
+     multiplexer and the transport, where the queue cannot see it, until
+     the ping safeguard closes the connection. A close with no recent
+     maker traffic is not a signal.
+
+   The node is *under pressure* while the queue signal is raised for any
+   relay connection.
+3. **Adaptation** *(amended 2026-10-28).*
+   - On a signal outside degraded mode -- a close signal, or the queue
+     signal becoming raised -- the rate in effect is recorded as the
+     *trip rate*. The rate then drops at once to the floor of 0.5
+     messages per second, and the outbox enters degraded mode (item 4).
+   - A signal while the outbox is degraded leaves the trip rate as it is.
+   - The outbox leaves degraded mode once 5 minutes have passed since the
+     last signal. A queue signal that stays raised counts as a signal at
+     every moment it is raised.
+   - It then releases at the floor, and the rate rises by 0.5 messages per
+     second every 60 seconds. The climb stops one step below the trip
+     rate, and never below the floor, so a rate at which a relay has
+     already failed is not tried again.
+   - After 30 minutes without a signal the trip rate is forgotten, and the
+     climb continues up to the ceiling (maintainer decision 2026-10-28,
+     D7).
+   - The signals are node-wide and apply to every outbox; each pubkey
+     keeps its own rate and trip rate.
+4. **Degraded mode.** While degraded, the outbox stops releasing created
+   and updated messages, and a keep-alive does not wait for its pair's
+   messages (R-MP3 item 2). Peers then learn the changes through the
+   keep-alive synchronization of §32.7.3. Cancellations are still released
+   at once. *Accepted cost:* a keep-alive then advertises a root that its
+   receivers cannot reach from the messages they hold, so each receiver
+   sends one synchronization request per pair per keep-alive: at most one
+   per 30 seconds per maker pubkey and pair.
+5. **Logging.** Each signal with its kind, entering and leaving degraded
+   mode, and each change of the rate are logged at most once per minute
+   per pubkey, with the rate. The line that enters degraded mode is
+   logged at once and is not held back by this limit *(added
+   2026-10-29)*; it counts as the minute's line for the others. Order
+   content is never logged.
+
+**R-MP3 (keep-alive ordering)** *(amended 2026-10-28)*. The keep-alive
+of R-K2/R-K2a is not counted against the budget, and it follows its
+pairs' changes where the budget allows.
+
+1. **Not budgeted.** A keep-alive is never counted against the budget,
+   and it waits no longer than item 2 allows.
+2. **Bounded wait.** On a tick, before the keep-alives of a maker pubkey
+   are published, the node waits until every pending outbox message for
+   an order on any of their pairs has been released within the budget,
+   for at most 10 seconds in total. In degraded mode it does not wait.
+   The keep-alives then leave, also while messages for their pairs are
+   still pending; those stay in the outbox and are released later, in
+   their order. The wait never releases a message beyond the budget.
+3. **No overtaking in the send queue.** A keep-alive is never queued
+   ahead of an order message already released, in any send-queue lane.
+   It may leave while messages it accounts for are still pending in the
+   outbox (item 2). A receiver then requests a synchronization, the cost
+   that R-MP2 item 4 accepts.
+
+**R-MP4 (keep-alive after reconnect).** When a connection to a relay is
+established and that relay has joined the relay mesh (§28.6 of
+[Chapter 28](28-libp2p-modernization.md)), the node publishes, within 5
+seconds, one keep-alive per pair per maker pubkey as on a tick, after
+the bounded wait of R-MP3 item 2 *(amended 2026-10-28)*. This round is in
+addition to the regular ticks and does not move them.
+
+**R-MP5 (metrics).** The metrics the node reports carry these aggregate
+values, with no peer identity and no content:
+- `p2p.send_queue.len`: queued data RPCs, summed over connections;
+- `p2p.send_queue.max_per_peer`: the largest single connection's count;
+- `p2p.send_queue.dropped.count`: data RPCs dropped under §28.9B RQ1
+  item 4 since start;
+- `p2p.outbox.pending`: pending outbox messages, summed over pubkeys;
+- `p2p.outbox.rate`: the current rate of R-MP2, the lowest over pubkeys;
+- `p2p.outbox.pressure`: 1 while the queue signal of R-MP2 item 2 is
+  raised, else 0;
+- `p2p.outbox.degraded`: 1 while any outbox is in degraded mode, else 0
+  *(added 2026-10-28)*;
+- `p2p.outbox.signals.queue.count` and `p2p.outbox.signals.close.count`:
+  the signals of each kind since start *(added 2026-10-28)*.
+
+*Rationale.* A relay can drain anything from more than 190 to fewer
+than 0.2 messages per second, depending on its host's load. Toward a
+slow reader, a sender cannot move a message ahead of those it has
+already sent.
+- An in-process measurement on 2026-10-28 published 90 updates per
+  second toward a reader taking about one per second. It delivered 0 of
+  10 keep-alives, both with a newest-first queue and with the capped queue
+  of §28.9B.
+- Every node drops a maker 90 seconds after its last keep-alive (R59.6.4).
+  So a maker that publishes faster than its relay drains loses its whole
+  book on every node.
+
+The outbox makes the rate a choice of the maker rather than of the
+bot driving it. The budget follows the relay's actual capacity, and the
+keep-alive is never queued behind messages that need not exist.
+
+R-MP3 item 2 keeps the advertised root reachable where the budget
+allows. A keep-alive that overtook its own pair's updates would advertise
+a root no receiver can reach yet, and every receiver would then request a
+synchronization. The wait is bounded because the keep-alive matters more:
+a late synchronization costs one request, a missing keep-alive costs the
+maker's whole book.
+
+*Amendment (2026-10-28).* The first in-process run of T-MP8 under the
+rules as first written delivered 0 of 30 keep-alives during the load,
+for three reasons:
+- toward a relay that stops reading, the backlog sits below the send
+  queue: the multiplexer grants each stream a 256 KiB window and the
+  transport buffers more, so the queue saw nothing until about 1,050 to
+  4,500 messages were in flight;
+- the unbudgeted flush before each keep-alive and the reconnect round
+  released whole backlogs at once;
+- the ping safeguard's close discarded what was in flight.
+
+Measured and not adopted: a ping round-trip signal (the round trip jumps
+from milliseconds straight to timeouts, so it gives no earlier warning),
+holding the ping close while degraded (it never engaged), and halving the
+rate on each close with a slow ceiling growth (more gaps over 90 s). The
+bounded wait with the close signal delivered, after the first close, 81
+keep-alives with a median delay of 1.3 s, a maximum of 19.5 s and no gap
+over 41 s toward a relay reading 1 message per second. At 0.3 messages
+per second the median was 3.6 s, the maximum 36.8 s and the longest gap
+68 s. A lab run against a relay whose inbound bandwidth was limited showed
+the other stall mode: pings passed, the connection never closed, the
+backlog grew in the send queue and the maker's book was dropped. The
+close signal never occurs there; the queue signal does. One residual
+stays: the first signal comes only after the load starts, about 50
+seconds later in process, so a burst of order changes can still cost one
+expiry of the maker's orders per new relay connection.
+
+R-MP4 replaces what a closing connection loses. Data still in the
+multiplexer's window when a connection closes is lost; §28.9B RQ1 item 5
+and the ping safeguard can both close a connection. The round restarts
+each relay's 90-second window and starts its synchronization, without
+waiting up to 30 seconds for the next tick.
+
+> **Reloaded divergence (informative).** The reference publishes every
+> maker-order message at once. Under R-MP1 and R-MP2 a peer may receive an
+> order's update up to about 1/rate seconds later, or, in degraded mode,
+> only through the next keep-alive synchronization. It may never see an
+> intermediate value of an order that changes quickly. Cancellations are
+> not delayed, and may arrive ahead of messages published before it (the
+> priority lane of §28.9B RQ1 item 9). In degraded mode, and when the
+> bounded wait of R-MP3 item 2 runs out, a keep-alive may advertise a root
+> that its receivers cannot yet reach; each receiver then sends one
+> synchronization request per pair. R-MP4 publishes keep-alives beyond
+> the ticks of R-K2a. Every
+> keep-alive has the shape R-K2a binds, and a receiver processes each one
+> on its own. No message format changes.
+>
+> Under `docs/COMPAT_SWITCHES.md`, "The default-side rule", this is arm 3.
+> The project team decided that Reloaded's variant is the default (decision
+> AO, 2026-10-28). **Compatibility:** to publish every order message at
+> once, set `maker_update_coalescing` to `false`. R-MP3 and R-MP4 are not
+> switched: they only order and add keep-alives of the bound shape.
+>
+> **Provenance.** Reloaded-original. Inputs: our own code, the in-process
+> measurements of 2026-10-28 (`docs/plans/gossip-send-queue-bound.md`), a
+> lab run of our maker against reference nodes run as black boxes, and the
+> gated facts already in §32.9A and R59.6.4 (the 90-second liveness window).
+
+**Tests (R-MP1–R-MP5).**
+
+- **T-MP1** *Merging.* Each row of the R-MP1 item 1 table produces the
+  stated pending message.
+- **T-MP2** *Cancellation.* A cancelled message is never merged away, is
+  released at once when the budget is exhausted, and leaves the
+  node in degraded mode too.
+- **T-MP3** *Swap messages bypass.* The four swap-negotiation messages are
+  published at once, with the outbox full and the budget exhausted.
+- **T-MP4** *Budget (amended 2026-10-28).* With an injected clock:
+  - the ceiling and the burst are respected;
+  - a close signal drops the rate to 0.5/s and enters degraded mode, and so
+    does the queue signal becoming raised;
+  - a relay close with no pending message and no release in the preceding
+    30 s is not a signal;
+  - the outbox leaves degraded mode 5 min after the last signal, not
+    earlier while the queue signal stays raised;
+  - the rate then rises by 0.5/s every 60 s and stops one step below the
+    trip rate; with a trip rate of 3/s it stops at 2.5/s;
+  - a close signal while degraded does not change the trip rate;
+  - after 30 min without a signal it climbs on to the ceiling;
+  - in degraded mode no created or updated message is released;
+  - a signal 10 s after an earlier log line is logged at once, at warn
+    level and with its kind *(added 2026-10-29)*.
+- **T-MP5** *Signals (amended 2026-10-28).* §28.9B T-RQ1.8, and:
+  - a data queue that stays non-empty for 2 s raises the queue signal,
+    and one that empties within 2 s does not;
+  - the signal clears after 5 s of an empty queue;
+  - the close of the last connection to a relay with a pending message
+    yields one close signal; the close of a connection to a non-relay
+    peer yields none.
+- **T-MP6** *Keep-alive ordering (amended 2026-10-28).*
+  - With a budget that releases them within 10 s, a pair's pending
+    messages are published before its keep-alive, and a receiver that
+    applies them in order holds the advertised root and sends no
+    synchronization request.
+  - With more pending than the budget releases in 10 s, the keep-alives
+    leave 10 s after the tick, give or take 1 s, and no message leaves
+    beyond the budget.
+  - In degraded mode the keep-alives leave at the tick.
+- **T-MP7** *Reconnect round.* After a forced close and a reconnect, one
+  keep-alive per pair leaves within 5 s of the relay rejoining the mesh,
+  plus the bounded wait.
+- **T-MP8** *Slow relay, in process (amended 2026-10-28).* A maker with
+  600 orders changes them at 90 updates per second for at least 600 s,
+  once toward a relay that reads about 1 message per second and once
+  toward one that reads about 0.3.
+  - After the first signal, the median delay from a tick to the arrival
+    of its keep-alive is at most 10 s, and no keep-alive arrives later
+    than 60 s after its tick. A keep-alive lost with a connection that
+    closes never arrives; it is reported, and the gap criterion below
+    bounds it.
+  - After the first signal, no gap between delivered keep-alives exceeds
+    90 s. Before it, one such gap is allowed (the residual of the
+    rationale).
+  - After the load stops, the relay's order set for the maker converges
+    to the maker's within 120 s.
+- **T-MP9** *Healthy relay.* Below the ceiling, every update is published
+  as soon as it is made. A relay that keeps up receives every update, and
+  no merging is visible.
+- **T-MP10** *Metrics.* The R-MP5 values are present and reflect a
+  queued backlog, drops, pending outbox messages, the rate and the
+  pressure state.
+- **T-MP11** *Switch.* With `maker_update_coalescing` set to `false`,
+  every order message is published at once.
+- **T-MP12** *Priority marking.*
+  - A cancellation and each swap-negotiation message are published with
+    priority, and so is one propagated by a relay.
+  - A created, updated or keep-alive message is not.
+  - Toward a paused relay with a full data queue, a cancellation arrives
+    first after resume.
+- **T-MP13** *Bandwidth-limited relay, lab (added 2026-10-28).* Not run
+  in CI. A maker with the T-MP8 load runs against a relay whose inbound
+  bandwidth is limited to 100 kbit/s, over a real network link, for at
+  least 25 minutes:
+  - the queue signal is raised, and the maker enters degraded mode;
+  - the maker's memory stays bounded;
+  - after the first 2 minutes, no node drops the maker's orders for a
+    missing keep-alive.
 
 ## 32.10 Deferred Work
 
@@ -1679,13 +2108,29 @@ D6. **Reference unboundedness, and Reloaded-original hardening
       — to be decided together with R-F3b);
     - **orphan release** — dereferencing a cleared slice's nodes so the
       periodic purge reclaims them, or rebuilding the node store from
-      the live roots at purge time;
+      the live roots at purge time (adopted: R-K4 item 4);
     - a **cap on concurrently handled inbound gossip messages** per
       peer or per topic, applied before the per-message task is spawned.
 
     Each is a divergence candidate to be recorded under the
     operator-facing compatibility documents when adopted, and none
     changes a wire shape.
+
+D7. **Recovery of the maker publication rate (§32.9B R-MP2 item 3;
+    resolved 2026-10-28, maintainer decision; added 2026-10-28).** The
+    rise stops one step below the trip rate, so that a rate at which a
+    relay already failed is not tried again. The rise was agreed without
+    its end: without one, a maker whose relay recovers would stay at the
+    lowered rate until restart. The alternatives were to forget the trip
+    rate after 30 minutes without a signal, or a slow growth of the
+    limit instead (+0.5 messages per second every 5 minutes, as in the
+    measured candidate that halved the rate on each close). The
+    maintainer chose the first, as R-MP2 item 3 states it: its worst
+    case is one more trip per 30 minutes against a relay that is still
+    slow. Still open: whether each new relay connection
+    should start at a low rate, which would close the residual gap of
+    the first signal. That option was not chosen on 2026-10-28; the
+    lab's T-MP13 runs should show whether the residual matters.
 
 ## 32.11 External References
 
@@ -2124,3 +2569,27 @@ V5. **Relay forward ordering at the baseline.** Confirm against the
   control on the build before the fix showed no growth attributable to the
   aggregated shape alone. The gated content -- the two shapes and what each
   costs a receiver -- is unchanged.
+- *Reloaded-original addition (2026-10-28), no forbidden-class input:* R-K4
+  (timer-driven expiry and capacity release of the delta histories, free expiry
+  refresh, node-store capacity release, node release on clear, gauges). *Inputs:*
+  this repository's own history, node-store and metrics code, and an in-process
+  measurement of it with a counting allocator (a 120,480-update burst for 30
+  orders of one pubkey retained about 1,240 bytes per update, 54 % in the delta
+  history, 28 % in unreferenced nodes, 14 % in table capacity, 4 % in
+  expiry-queue elements; the history caches expire only when touched; a
+  full-snapshot clear leaked about 6 KB per 30-order pair). The reference facts
+  it relies on are the gated ones of D6 and of §32.9A R-B1 rows 3 and 6 (bounds,
+  purge period, nodes of a cleared slice never released); nothing else from the
+  reference was used.
+- *Reloaded-original addition (2026-10-28, Decision AN): R-Q5b, its
+  divergence note, the amendment of R-T3b item 3, the sentence appended to
+  R-Q6, and T-Q5b.* A relay answers a request for a pair it is still
+  synchronizing when that synchronization lands, within a bound, with the
+  opt-back setting. *Inputs:* this repository's own keep-alive receiver,
+  synchronization requester and responder and inbound request dispatch; the
+  gated rules of this chapter as merged (R-F3a, R-Q5, R-Q5a, R-Q6), on which
+  the rule builds without adding any reference fact; a lab run of reference
+  binaries as black boxes (subscribers of a reference seed failed with the
+  placeholder error at the first keep-alive after a wipe and were rebuilt
+  about a minute later); and the maintainer's decision. No reference
+  implementation was consulted for this item, and it needs no Dirty Gate pass.

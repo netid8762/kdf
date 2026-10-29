@@ -206,6 +206,10 @@ impl LightCoinFixture {
             z_unspent_mutex: AsyncMutex::new(()),
             in_flight_spends: Mutex::new(HashMap::new()),
             send_pacing: test_pacing(in_flight_wait_secs),
+            electrum_fallback: z_electrum_fallback::ElectrumFallback::new(
+                "ARRR",
+                z_electrum_fallback::tests::ScriptedElectrum::none(),
+            ),
             shielded_sync_error: Mutex::new(None),
             sapling_state_synced: AtomicBool::new(true),
             sapling_loop_error: Mutex::new(None),
@@ -257,6 +261,32 @@ impl LightCoinFixture {
     }
 
     fn history(&self) -> &ZCoinShieldedHistory { &self.coin.z_fields.shielded_history }
+
+    /// Gives the coin's Electrum fallback the scripted servers `electrum` (CRD ch.39 R39.11.25).
+    fn with_electrum(mut self, electrum: Arc<z_electrum_fallback::tests::ScriptedElectrum>) -> Self {
+        Arc::get_mut(&mut self.coin.z_fields)
+            .expect("the fixture's coin is not shared")
+            .electrum_fallback = z_electrum_fallback::ElectrumFallback::new("ARRR", electrum);
+        self
+    }
+
+    /// Every scripted lightwalletd endpoint answers every transparent-address read with the node's
+    /// no-address-index rejection (R39.11.4i).
+    fn without_address_index(&self) {
+        for script in self.transport.scripts.lock().values_mut() {
+            script.address_error = Some(EndpointError::NoAddressIndex(format!(
+                "Internal error: -5: {}",
+                z_lightwalletd::NO_ADDRESS_INDEX_MESSAGE
+            )));
+        }
+    }
+
+    /// Every scripted lightwalletd endpoint reports `hash` for the block at `height`.
+    fn report_block_hash(&self, height: u64, hash: [u8; 32]) {
+        for script in self.transport.scripts.lock().values_mut() {
+            script.block_hashes.insert(height, hash);
+        }
+    }
 
     fn output(&self, amount_sat: u64) -> ZOutput {
         ZOutput {
@@ -1624,5 +1654,407 @@ mod own_send_record {
 
         let error = answer.expect_err("an unreadable record never answers, either way");
         assert!(error.contains("the HTLC could not be searched for"), "{error}");
+    }
+
+    /// The own-send record still answers before any Electrum server is asked, even where every
+    /// lightwalletd endpoint keeps no address index and a server that would answer "not sent" is listed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_record_answers_before_the_electrum_fallback_is_asked() {
+        use crate::z_coin::z_electrum_fallback::tests::{full_header, ScriptedElectrum};
+        let Some(fixture) = LightCoinFixture::new() else { return };
+        let funding = fund_htlc(&fixture).await;
+        let electrum = ScriptedElectrum::healthy(&["e1"], fixture.tip, &full_header());
+        electrum.edit("e1", |s| s.history = Some(Ok(vec![])));
+        let restarted = fixture.reopen().with_electrum(electrum.clone());
+        restarted.without_address_index();
+
+        let found = already_sent(&restarted, MY_KEY, OTHER_KEY).await;
+
+        assert_is(found, &funding);
+        assert!(
+            electrum.calls().is_empty(),
+            "Electrum was never asked: {:?}",
+            electrum.calls()
+        );
+        assert_eq!(address_requests(&restarted), 0, "{:?}", methods(&restarted));
+    }
+}
+
+/// T39.11.p (R39.11.25): the three swap-path questions of a Light-mode coin over the scripted
+/// lightwalletd backend and scripted Electrum servers, asked through the swap trait. The payment and
+/// the refund are the live ARRR pair of `per_swap_htlc_key_recovery`.
+mod electrum_fallback {
+    use super::*;
+    use crate::z_coin::z_electrum_fallback::tests::{full_header, hash_of, item, ScriptedElectrum};
+    use crate::z_coin::z_electrum_fallback::{UnspentItem, IDENTITY_DEPTH};
+    use crate::SwapOps;
+
+    const PAYMENT_HEX: &str = include_str!("test-fixtures/arrr-htlc-payment-75566e4d.hex");
+    const REFUND_HEX: &str = include_str!("test-fixtures/arrr-htlc-refund-0496f6d3.hex");
+    const TIME_LOCK: u32 = 1_790_664_056;
+    const TAKER_KEY: &str = "03cd3144d880ce80ce9f2f4c24feb12d011bd6f067cdb44dcd2c41438923d64fe2";
+    const MAKER_KEY: &str = "02ccd091588f2acb3b5320dc53950f7b00fff8dfae39286d745e96bed48f49c580";
+    const SECRET_HASH: &str = "cb03f4f75479eb6731672f14069d05e1a08d8349";
+    const SEARCH_FROM: u64 = 3;
+    const SERVER: &str = "electrum1.example:50001";
+
+    fn bytes(hex_str: &str) -> Vec<u8> { hex::decode(hex_str.trim()).unwrap() }
+
+    /// A coin whose lightwalletd endpoints keep no address index and whose Electrum servers are healthy
+    /// and on the same chain.
+    fn coin_with_marked_endpoints() -> Option<(LightCoinFixture, Arc<ScriptedElectrum>)> {
+        let fixture = LightCoinFixture::new()?;
+        let electrum = ScriptedElectrum::healthy(&[SERVER], fixture.tip, &full_header());
+        fixture.without_address_index();
+        fixture.report_block_hash(fixture.tip - IDENTITY_DEPTH, hash_of(&full_header()));
+        Some((fixture.with_electrum(electrum.clone()), electrum))
+    }
+
+    async fn already_sent(
+        fixture: &LightCoinFixture,
+        my_key: &str,
+        other_key: &str,
+    ) -> Result<Option<crate::TransactionEnum>, String> {
+        fixture
+            .coin
+            .check_if_my_payment_sent(
+                TIME_LOCK,
+                &bytes(my_key),
+                &bytes(other_key),
+                &bytes(SECRET_HASH),
+                SEARCH_FROM,
+                &None,
+            )
+            .compat()
+            .await
+    }
+
+    async fn spend_of_payment(fixture: &LightCoinFixture) -> Result<Option<FoundSwapTxSpend>, String> {
+        fixture
+            .coin
+            .search_for_swap_tx_spend_my(
+                TIME_LOCK,
+                &bytes(TAKER_KEY),
+                &bytes(MAKER_KEY),
+                &bytes(SECRET_HASH),
+                &bytes(PAYMENT_HEX),
+                SEARCH_FROM,
+                &None,
+            )
+            .await
+    }
+
+    /// An endpoint that answers is final: Electrum is not asked, for any of the questions, and the client
+    /// is not even built.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lightwalletd_answer_is_final_and_electrum_is_never_asked() {
+        let Some(fixture) = LightCoinFixture::new() else { return };
+        let electrum = ScriptedElectrum::healthy(&[SERVER], fixture.tip, &full_header());
+        // What Electrum would say, if asked, differs from what lightwalletd says.
+        electrum.edit(SERVER, |s| s.history = Some(Ok(vec![item(&bytes(PAYMENT_HEX), 5)])));
+        for script in fixture.transport.scripts.lock().values_mut() {
+            script.transaction = Some(Ok(RawTx {
+                data: bytes(PAYMENT_HEX),
+                height: Some(5),
+            }));
+            script.history = vec![RawTx {
+                data: bytes(REFUND_HEX),
+                height: Some(8),
+            }];
+        }
+        let fixture = fixture.with_electrum(electrum.clone());
+
+        // Spend search: lightwalletd finds the refund.
+        match spend_of_payment(&fixture).await.expect("lightwalletd answers") {
+            Some(FoundSwapTxSpend::Refunded(tx)) => assert_eq!(tx.tx_hex(), bytes(REFUND_HEX)),
+            other => panic!("expected the live refund, got {other:?}"),
+        }
+        // Already-sent: lightwalletd's healthy empty history for another key pair is "not sent".
+        let sent = already_sent(&fixture, MAKER_KEY, TAKER_KEY)
+            .await
+            .expect("lightwalletd answers");
+        assert!(sent.is_none(), "a negative lightwalletd answer is final too");
+        // Spend watch: one poll, answered by lightwalletd.
+        let spend = fixture
+            .coin
+            .wait_for_tx_spend(&bytes(PAYMENT_HEX), common::now_ms() / 1000 + 30, SEARCH_FROM, &None)
+            .compat()
+            .await
+            .expect("lightwalletd answers the poll");
+        assert_eq!(spend.tx_hex(), bytes(REFUND_HEX));
+
+        assert!(
+            electrum.calls().is_empty(),
+            "Electrum was asked: {:?}",
+            electrum.calls()
+        );
+    }
+
+    /// With every endpoint marked "no address index", already-sent is answered from Electrum, "sent" and
+    /// "not sent" alike.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn already_sent_is_answered_from_electrum_when_every_endpoint_is_marked() {
+        let Some((fixture, electrum)) = coin_with_marked_endpoints() else {
+            return;
+        };
+        let payment = bytes(PAYMENT_HEX);
+        electrum.edit(SERVER, |s| s.history = Some(Ok(vec![item(&payment, 5)])));
+        electrum.serve_transaction(SERVER, &payment);
+
+        let sent = already_sent(&fixture, TAKER_KEY, MAKER_KEY)
+            .await
+            .expect("Electrum answers");
+        assert_eq!(sent.expect("sent").tx_hex(), payment);
+
+        // The endpoints are now marked; a second question skips them and Electrum answers again, "not
+        // sent" with a complete, empty history of another script.
+        electrum.edit(SERVER, |s| s.history = Some(Ok(vec![])));
+        let not_sent = already_sent(&fixture, MAKER_KEY, TAKER_KEY)
+            .await
+            .expect("Electrum answers");
+        assert!(not_sent.is_none());
+        assert!(electrum.asked(SERVER, "history") >= 2);
+    }
+
+    /// The one-shot spend search is answered from Electrum, and the spend it finds is classified by the
+    /// shared rule.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_spend_search_is_answered_from_electrum_when_every_endpoint_is_marked() {
+        let Some((fixture, electrum)) = coin_with_marked_endpoints() else {
+            return;
+        };
+        let (payment, refund) = (bytes(PAYMENT_HEX), bytes(REFUND_HEX));
+        electrum.edit(SERVER, |s| {
+            s.history = Some(Ok(vec![item(&payment, 5), item(&refund, 8)]));
+        });
+        electrum.serve_transaction(SERVER, &refund);
+
+        match spend_of_payment(&fixture).await.expect("Electrum answers") {
+            Some(FoundSwapTxSpend::Refunded(tx)) => assert_eq!(tx.tx_hex(), refund),
+            other => panic!("expected the live refund, got {other:?}"),
+        }
+
+        // No spender in the history: "not spent" needs the unspent listing.
+        electrum.edit(SERVER, |s| s.history = Some(Ok(vec![item(&payment, 5)])));
+        let error = spend_of_payment(&fixture)
+            .await
+            .expect_err("undetermined without the listing");
+        assert!(error.contains("Electrum fallback"), "{error}");
+        let funding = item(&payment, 5).txid;
+        electrum.edit(SERVER, |s| {
+            s.unspent = Some(Ok(vec![UnspentItem { txid: funding, vout: 0 }]))
+        });
+        assert!(spend_of_payment(&fixture).await.expect("Electrum answers").is_none());
+    }
+
+    /// A poll of the spend watch is answered from Electrum, and the wait ends with the spender.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_spend_watch_poll_is_answered_from_electrum_when_every_endpoint_is_marked() {
+        let Some((fixture, electrum)) = coin_with_marked_endpoints() else {
+            return;
+        };
+        let (payment, refund) = (bytes(PAYMENT_HEX), bytes(REFUND_HEX));
+        electrum.edit(SERVER, |s| {
+            s.history = Some(Ok(vec![item(&payment, 5), item(&refund, 8)]))
+        });
+        electrum.serve_transaction(SERVER, &refund);
+
+        let spend = fixture
+            .coin
+            .wait_for_tx_spend(&payment, common::now_ms() / 1000 + 30, SEARCH_FROM, &None)
+            .compat()
+            .await
+            .expect("the first poll finds the spender through Electrum");
+
+        assert_eq!(spend.tx_hex(), refund);
+    }
+
+    /// When neither source answers the error carries the conditions of both, and they are on the
+    /// sync-error channel; without a listed Electrum server it is lightwalletd's text alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn when_neither_source_answers_the_error_names_both() {
+        let Some((fixture, electrum)) = coin_with_marked_endpoints() else {
+            return;
+        };
+        electrum.edit(SERVER, |s| s.history = Some(Err("history too large".to_owned())));
+
+        let error = already_sent(&fixture, TAKER_KEY, MAKER_KEY)
+            .await
+            .expect_err("undetermined");
+
+        assert!(
+            error.contains("keeps no address index"),
+            "lightwalletd's condition: {error}"
+        );
+        assert!(error.contains("Electrum fallback"), "{error}");
+        assert!(error.contains(&format!("{SERVER}: history too large")), "{error}");
+        assert_eq!(fixture.coin.shielded_sync_error().as_deref(), Some(error.as_str()));
+
+        let Some(plain) = LightCoinFixture::new() else { return };
+        plain.without_address_index();
+        let error = already_sent(&plain, TAKER_KEY, MAKER_KEY)
+            .await
+            .expect_err("undetermined");
+        assert!(error.contains("keeps no address index"), "{error}");
+        assert!(!error.contains("Electrum"), "no fallback is configured: {error}");
+    }
+
+    /// A server on another chain is not used at the coin level either, and the question is undetermined.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_server_on_another_chain_never_answers_for_the_coin() {
+        let Some((fixture, electrum)) = coin_with_marked_endpoints() else {
+            return;
+        };
+        let mut other = full_header();
+        other[10] ^= 1;
+        electrum.edit(SERVER, |s| {
+            s.header = Some(Ok(other));
+            s.history = Some(Ok(vec![])); // would be "not sent"
+        });
+
+        let error = already_sent(&fixture, TAKER_KEY, MAKER_KEY)
+            .await
+            .expect_err("not used, so undetermined");
+
+        assert!(error.contains("not on this coin's chain"), "{error}");
+        assert_eq!(electrum.asked(SERVER, "history"), 0);
+    }
+}
+
+/// The refund gate of a shielded leg (CRD ch.39 R39.5.13, T39.5.f), over the scripted backend whose
+/// block at height `h` carries time `1000 + h`: with the tip at 100 the median time past of the last
+/// 11 blocks is 1095.
+mod refund_gate {
+    use super::*;
+    use crate::{CanRefundHtlc, SwapOps};
+
+    const TIP: u64 = 100;
+    const MTP_AT_TIP: u64 = 1_095;
+
+    fn script_tip(fixture: &LightCoinFixture, tip: Option<u64>) {
+        for script in fixture.transport.scripts.lock().values_mut() {
+            script.tips.clear();
+            script.tip_floor = tip;
+        }
+    }
+
+    fn reads(fixture: &LightCoinFixture, method: &'static str) -> usize {
+        SERVERS.iter().map(|s| fixture.transport.called(s, method)).sum()
+    }
+
+    async fn gate(fixture: &LightCoinFixture, locktime: u64) -> Result<CanRefundHtlc, String> {
+        fixture.coin.can_refund_htlc(locktime).compat().await
+    }
+
+    fn waits(answer: Result<CanRefundHtlc, String>) -> u64 {
+        match answer.expect("the gate answers") {
+            CanRefundHtlc::HaveToWait(secs) => secs,
+            CanRefundHtlc::CanRefundNow => panic!("the refund was permitted"),
+        }
+    }
+
+    /// While the wall clock has not passed the lock time the gate waits as it always did and reads
+    /// nothing from the chain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_wall_clock_wait_reads_no_chain_data() {
+        let Some(fixture) = LightCoinFixture::new() else { return };
+        script_tip(&fixture, Some(TIP));
+        let in_a_while = common::now_ms() / 1000 + 1_000;
+
+        let secs = waits(gate(&fixture, in_a_while).await);
+
+        assert!((1_000..=1_002).contains(&secs), "{secs}");
+        assert_eq!(reads(&fixture, "tip"), 0);
+        assert_eq!(reads(&fixture, "time"), 0);
+        assert_eq!(
+            fixture
+                .coin
+                .refund_gate_closed_note(in_a_while)
+                .compat()
+                .await
+                .map(|n| n.is_some()),
+            Ok(true)
+        );
+        assert_eq!(reads(&fixture, "tip"), 0, "the recovery note reads nothing either");
+    }
+
+    /// The wall clock has passed the lock time but the median time past has not: the refund waits, by
+    /// the distance to the median and never more than an hour.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_median_time_not_past_the_lock_time_waits_even_though_the_wall_clock_has_passed() {
+        let Some(fixture) = LightCoinFixture::new() else { return };
+        script_tip(&fixture, Some(TIP));
+
+        assert_eq!(
+            waits(gate(&fixture, MTP_AT_TIP).await),
+            1,
+            "the median equals the lock time"
+        );
+        assert_eq!(waits(gate(&fixture, MTP_AT_TIP + 100).await), 101);
+        assert_eq!(
+            waits(gate(&fixture, 100_000).await),
+            3_600,
+            "a wait of {} s is capped",
+            100_000 - MTP_AT_TIP + 1
+        );
+        // The window is the 11 blocks ending at the tip, read from the one admitted tip.
+        assert_eq!(reads(&fixture, "time"), 3 * 11);
+        assert_eq!(reads(&fixture, "tip"), 3);
+    }
+
+    /// Once the median time past exceeds the lock time the refund is permitted; at the lock time itself it
+    /// is not, as a node judges a lock time final only when it is strictly below the median.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_median_time_past_the_lock_time_permits_the_refund() {
+        let Some(fixture) = LightCoinFixture::new() else { return };
+        script_tip(&fixture, Some(TIP));
+
+        assert!(matches!(
+            gate(&fixture, MTP_AT_TIP - 1).await,
+            Ok(CanRefundHtlc::CanRefundNow)
+        ));
+        assert!(matches!(
+            gate(&fixture, MTP_AT_TIP).await,
+            Ok(CanRefundHtlc::HaveToWait(1))
+        ));
+        assert_eq!(
+            fixture.coin.refund_gate_closed_note(MTP_AT_TIP - 1).compat().await,
+            Ok(None),
+            "an open gate has nothing to report"
+        );
+    }
+
+    /// A chain that cannot be read is an error the stage retries, never an open gate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_chain_read_failure_is_an_error() {
+        let Some(fixture) = LightCoinFixture::new() else { return };
+        script_tip(&fixture, None);
+
+        let err = match gate(&fixture, 1_000).await {
+            Err(e) => e,
+            Ok(_) => panic!("an unreadable chain opened the gate"),
+        };
+        assert!(err.contains("median time past"), "{err}");
+        let recovery_err = fixture.coin.refund_gate_closed_note(1_000).compat().await.unwrap_err();
+        assert!(recovery_err.contains("median time past"), "{recovery_err}");
+    }
+
+    /// `recover_funds_of_swap` before the gate opens is told the lock time and the median it is waiting for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_recovery_note_names_the_lock_time_and_the_current_median() {
+        let Some(fixture) = LightCoinFixture::new() else { return };
+        script_tip(&fixture, Some(TIP));
+
+        let note = fixture
+            .coin
+            .refund_gate_closed_note(MTP_AT_TIP + 100)
+            .compat()
+            .await
+            .unwrap()
+            .expect("the gate is closed");
+
+        assert!(note.contains(&(MTP_AT_TIP + 100).to_string()), "{note}");
+        assert!(note.contains(&MTP_AT_TIP.to_string()), "{note}");
+        assert!(note.contains("median time past"), "{note}");
     }
 }

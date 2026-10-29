@@ -54,7 +54,11 @@ fn coin_over_entries(coin_type: EthCoinType, eth_extra: Json, jst_extra: Json) -
         &hex::decode("809465b17d0a4ddb3e4c69e8f23c2cabad868f51f8bed5c765ad1d6516c3306f").unwrap(),
     )
     .unwrap();
-    let web3 = crate::eth::alloy_compat::build_provider(vec!["http://dummy.dummy".to_owned()], vec![]).unwrap();
+    let web3 = crate::eth::alloy_compat::build_provider(
+        crate::eth::node_url::listed_nodes("TEST", vec!["http://dummy.dummy".to_owned()]),
+        vec![],
+    )
+    .unwrap();
     let my_address = key_pair.address();
     let coin = EthCoin(Arc::new(EthCoinImpl {
         coin_type,
@@ -413,6 +417,53 @@ fn a_token_with_its_own_block_wins_and_a_silent_token_inherits_the_platform_bloc
     assert_eq!(sent_gas(), vec![222_222, 111_111, 21_000]);
 }
 
+/// A token's own `gas_limit` block with no block on its platform entry -- the shape and values of a coins file
+/// running in production (2026-10). Every call site of the four keys uses the token's values, and a key the
+/// block omits is the code default. A platform block, when one exists, contributes nothing to such a token.
+#[test]
+fn a_token_with_its_own_block_and_a_platform_without_one_uses_its_values_at_every_call_site() {
+    mock_payment_sent();
+    mock_gas_price_one();
+    EthCoin::allowance.mock_safe(|_, _| MockResult::Return(Box::new(futures01::future::ok(U256::max_value()))));
+    let swap = Address::from_str("7Bc1bBDD6A0a722fC9bffC49c921B685ECB84b94").unwrap();
+    let own = json!({"gas_limit": {"eth_send_erc20": 150_000, "erc20_payment": 250_000,
+                                   "erc20_receiver_spend": 200_000, "erc20_sender_refund": 200_000}});
+    let default_trade_gas = EthGasLimit::default().eth_max_trade_gas;
+
+    // The first platform entry has no block. The second has one whose every member differs, and the token's own
+    // block replaces it as a whole.
+    let platform_block = json!({"gas_limit": {"eth_send_erc20": 1_111, "erc20_payment": 2_222,
+                                              "erc20_receiver_spend": 3_333, "erc20_sender_refund": 4_444,
+                                              "eth_max_trade_gas": 5_555}});
+    for platform in [json!({}), platform_block] {
+        capture_sent_gas();
+        let token = token_coin(platform.clone(), own.clone());
+        run(token.send_to_address(token_address(), U256::one()));
+        run(token.send_hash_time_locked_payment(vec![1; 32], U256::one(), 1_800_000_000, &[2; 20], swap, swap));
+        run(token.spend_hash_time_locked_payment(payment_tx(&token), swap, &[5; 32]));
+        run(token.refund_hash_time_locked_payment(swap, payment_tx(&token)));
+        assert_eq!(
+            sent_gas(),
+            vec![150_000, 250_000, 200_000, 200_000],
+            "platform {platform}"
+        );
+
+        // The fee quotes read the same keys: payment plus refund for the sender, the spend for the receiver.
+        let fee =
+            block_on(token.get_sender_trade_fee(TradePreimageValue::Exact(1.into()), FeeApproxStage::WithoutApprox));
+        assert_eq!(fee.unwrap(), wei_amount(250_000 + 200_000), "platform {platform}");
+        let fee = token.get_receiver_trade_fee(FeeApproxStage::WithoutApprox).wait();
+        assert_eq!(fee.unwrap(), wei_amount(200_000), "platform {platform}");
+
+        // `eth_max_trade_gas` is not in the token's block, so it is the code default, never the platform's 5555.
+        assert_eq!(
+            token.get_trade_fee().wait().unwrap(),
+            wei_amount(default_trade_gas),
+            "platform {platform}"
+        );
+    }
+}
+
 // ─── T6: the V2 selection matrix ────────────────────────────────────────────────────────────────────
 
 fn v2_config() -> Json {
@@ -613,6 +664,62 @@ fn t9_the_activation_builder_rejects_an_unusable_member_naming_the_key() {
     match err.get_inner() {
         EthCoinBuildError::InvalidConfig(message) => assert!(message.contains("gas_limit.eth_payment"), "{message}"),
         other => panic!("expected InvalidConfig, got {other:?}"),
+    }
+}
+
+/// CRD ch.38 R38.6.6k item 1: a per-coin `fee_estimate_cache_secs` outside 0 to 600 fails the coin's activation,
+/// naming the key, before any node is contacted; a token reads its own entry, else its platform coin's.
+#[test]
+fn t10_an_unusable_fee_estimate_cache_secs_fails_the_activation_naming_the_key() {
+    let params = EthCoinActivationParams {
+        urls: vec!["http://dummy.dummy".to_owned()],
+        swap_contract_address: Some(Address::from_str("7Bc1bBDD6A0a722fC9bffC49c921B685ECB84b94").unwrap()),
+        ..Default::default()
+    };
+    let activate = |ctx: &MmArc, ticker: &str, conf: &Json, protocol: CoinProtocol| {
+        block_on(eth_coin_from_params_with_priv_key(
+            ctx, ticker, conf, &params, &[1u8; 32], protocol,
+        ))
+    };
+    let platform_conf =
+        |secs: Json| json!({"coin": "ETH", "protocol": {"type": "ETH"}, "fee_estimate_cache_secs": secs});
+    let token_conf = json!({"coin": "JST", "mm2": 1, "decimals": 18, "protocol": {"type": "ERC20",
+        "protocol_data": {"platform": "ETH", "contract_address": format!("0x{TOKEN_ADDR}")}}});
+    let erc20 = || CoinProtocol::ERC20 {
+        platform: "ETH".to_owned(),
+        contract_address: format!("0x{TOKEN_ADDR}"),
+    };
+    for bad in [json!(601), json!(-1), json!("5"), json!(1.5)] {
+        let conf = platform_conf(bad.clone());
+        let ctx = MmCtxBuilder::new()
+            .with_conf(
+                json!({"netid": mm2_net_config::SUPPORTED_NETIDS[0], "coins": [conf.clone(), token_conf.clone()]}),
+            )
+            .into_mm_arc();
+        // The platform coin's own entry.
+        let err = activate(&ctx, "ETH", &conf, CoinProtocol::ETH { chain_id: None }).unwrap_err();
+        match err.get_inner() {
+            EthCoinBuildError::InvalidConfig(message) => {
+                assert!(message.contains("fee_estimate_cache_secs"), "{bad}: {message}")
+            },
+            other => panic!("expected InvalidConfig for {bad}, got {other:?}"),
+        }
+        // A token with no value of its own reads the platform's.
+        let err = activate(&ctx, "JST", &token_conf, erc20()).unwrap_err();
+        match err.get_inner() {
+            EthCoinBuildError::InvalidConfig(message) => {
+                assert!(message.contains("fee_estimate_cache_secs"), "{bad}: {message}")
+            },
+            other => panic!("expected InvalidConfig for the token over {bad}, got {other:?}"),
+        }
+    }
+    // A usable value does not fail on the key (the activation then goes on to its nodes, which are unreachable).
+    let conf = platform_conf(json!(600));
+    let ctx = MmCtxBuilder::new()
+        .with_conf(json!({"netid": mm2_net_config::SUPPORTED_NETIDS[0], "coins": [conf.clone()]}))
+        .into_mm_arc();
+    if let Err(err) = activate(&ctx, "ETH", &conf, CoinProtocol::ETH { chain_id: None }) {
+        assert!(!err.to_string().contains("fee_estimate_cache_secs"), "{err}");
     }
 }
 

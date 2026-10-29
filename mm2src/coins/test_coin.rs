@@ -248,7 +248,33 @@ impl SwapOps for TestCoin {
         None
     }
 
+    fn htlc_key_is_random_per_swap(&self) -> bool { false }
+
+    async fn ensure_own_payment_watchable(&self) -> Result<(), String> { Ok(()) }
+
     fn extract_secret(&self, secret_hash: &[u8], spend_tx: &[u8]) -> Result<Vec<u8>, String> { unimplemented!() }
+
+    fn can_refund_htlc(
+        &self,
+        locktime: u64,
+    ) -> Box<dyn Future<Item = crate::CanRefundHtlc, Error = String> + Send + '_> {
+        let now = common::now_ms() / 1000;
+        let result = if now > locktime {
+            crate::CanRefundHtlc::CanRefundNow
+        } else {
+            crate::CanRefundHtlc::HaveToWait(locktime - now + 1)
+        };
+        Box::new(futures01::future::ok(result))
+    }
+
+    fn retriable_refund_rejection(&self, rejection: &str) -> Option<String> { None }
+
+    fn refund_gate_closed_note(
+        &self,
+        locktime: u64,
+    ) -> Box<dyn Future<Item = Option<String>, Error = String> + Send + '_> {
+        Box::new(futures01::future::ok(None))
+    }
 
     fn negotiate_swap_contract_addr(
         &self,

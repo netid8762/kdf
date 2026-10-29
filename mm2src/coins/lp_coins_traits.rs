@@ -147,6 +147,22 @@ pub trait SwapOps {
         None
     }
 
+    /// Whether this coin's HTLC script is unique to one swap by construction: the key it pays to is
+    /// random per swap ([`SwapOps::get_htlc_key_pair`]) and the secret hash is fresh, so no payment to
+    /// the script can exist unless the swap sent it (CRD ch.39 R39.5.4, R39.11.27). The swap layer uses
+    /// this to skip the already-sent question in a swap this process started a moment ago.
+    ///
+    /// The default is `false`: every other coin pays a script that the persistent key (or the chain's own
+    /// rules) can reproduce, and keeps asking.
+    fn htlc_key_is_random_per_swap(&self) -> bool { false }
+
+    /// Whether this coin can watch the taker's own payment for the maker's spend, checked before the taker
+    /// fee is sent (CRD ch.39 R39.11.28). The error names every source that could not answer.
+    ///
+    /// The default is `Ok(())`: only a Light-mode shielded coin, whose watch depends on the address
+    /// questions of a remote index, can be unable to watch.
+    async fn ensure_own_payment_watchable(&self) -> Result<(), String> { Ok(()) }
+
     fn extract_secret(&self, secret_hash: &[u8], spend_tx: &[u8]) -> Result<Vec<u8>, String>;
 
     /// Whether the refund transaction can be sent now
@@ -160,6 +176,24 @@ pub trait SwapOps {
             CanRefundHtlc::HaveToWait(locktime - now + 1)
         };
         Box::new(futures01::future::ok(result))
+    }
+
+    /// CRD ch.39 R39.5.13. When the refund broadcast of this coin was rejected with `rejection` (the plain
+    /// text of the failure) and the rejection says that the transaction is not yet final, returns the part
+    /// of the node's text worth logging; the refund stage then waits and goes back to the refund gate
+    /// instead of ending the swap in the refund-failed state. Every other rejection, and every other coin,
+    /// is terminal as before, which is the default.
+    fn retriable_refund_rejection(&self, _rejection: &str) -> Option<String> { None }
+
+    /// CRD ch.39 R39.5.13. For a coin whose refund gate waits for the chain's median time past: why the
+    /// refund may not be built yet, or `None` when the gate is open. `recover_funds_of_swap` asks it after
+    /// its own deadline check. The default reads nothing and answers `None`, so every other coin's
+    /// recovery is unchanged.
+    fn refund_gate_closed_note(
+        &self,
+        _locktime: u64,
+    ) -> Box<dyn Future<Item = Option<String>, Error = String> + Send + '_> {
+        Box::new(futures01::future::ok(None))
     }
 
     fn negotiate_swap_contract_addr(
