@@ -41,7 +41,6 @@ jobs:
       matrix:
         target:
           - x86_64-apple-darwin
-          - aarch64-apple-darwin
 
     steps:
       - uses: actions/checkout@v7
@@ -77,34 +76,3 @@ jobs:
         with:
           name: kdf-${{ matrix.target }}
           path: target/${{ matrix.target }}/${{ inputs.profile }}/kdf
-
-  universal:
-    needs: build
-    runs-on: macos-latest
-    timeout-minutes: 15
-
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          name: kdf-x86_64-apple-darwin
-          path: artifacts/x86_64
-
-      - uses: actions/download-artifact@v8
-        with:
-          name: kdf-aarch64-apple-darwin
-          path: artifacts/aarch64
-
-      - name: Build universal binary via lipo
-        run: |
-          chmod +x artifacts/x86_64/kdf artifacts/aarch64/kdf
-          mkdir -p dist
-          lipo -create -output dist/kdf-universal \
-            artifacts/x86_64/kdf \
-            artifacts/aarch64/kdf
-          lipo -info dist/kdf-universal
-
-      - name: Upload universal binary
-        uses: actions/upload-artifact@v7
-        with:
-          name: kdf-universal-apple-darwin
-          path: dist/kdf-universal
