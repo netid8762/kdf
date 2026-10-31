@@ -36,8 +36,9 @@ the one crate is the proportionate fix.
 
 ## The patch
 
-Three call sites, all in the backoff path. Apart from the send queue change described
-below, everything else is byte-identical to the fork, including the relay-mesh extension
+Three call sites, all in the backoff path. Apart from the send queue change, the priority lane overflow
+change, the log levels and the validate-without-forwarding method described below, everything else is
+byte-identical to the fork, including the relay-mesh extension
 (`i_am_relay` / `IAmRelay`) that is the reason the fork exists.
 
 1. **`src/behaviour.rs`** — `remove_peer_from_mesh` clamps the peer-supplied value
@@ -64,7 +65,8 @@ Regression tests live in `src/backoff.rs` under `mod tests`.
 ## Bounded per-connection send queue (not security-related)
 
 A second, unrelated change, so the "byte-identical" statement above now reads: the rest of the
-crate is byte-identical to the fork except for the backoff patch and this change. It implements
+crate is byte-identical to the fork except for the backoff patch, this change, the priority lane
+overflow change and the validate-without-forwarding method below. It implements
 CRD ch.28 §28.9B RQ1 (Reloaded-original; the reference leaves this queue unbounded). The wire is
 unchanged.
 
@@ -103,7 +105,7 @@ one that answers pings and reads no gossip.
 `src/behaviour/tests.rs` changes only for the new `Handler::new` arguments.
 
 **Tests.** `cargo test --manifest-path vendor-patches/libp2p-gossipsub-0.45.0/Cargo.toml --lib -- send_queue:: handler::tests`
-(29 tests), and `cargo test -p mm2_p2p --test gossip_send_queue` (in-process, fast tests).
+(35 tests), and `cargo test -p mm2_p2p --test gossip_send_queue` (in-process, fast tests).
 The six upstream failures listed under "Test status" are unchanged.
 
 ## Pressure signal and priority lane (not security-related)
@@ -119,15 +121,16 @@ cancellations and swap negotiation messages must not wait behind queued order up
 
 1. **`src/send_queue.rs`** -- `SendQueue` gains a *priority lane*, a separate FIFO that `pop`
    serves before everything else. A priority RPC does not count toward the data cap and is never
-   dropped. A lane that already holds 256 RPCs (`priority_max`) refuses the next one and reports an
-   overflow once. It also derives a *pressure* level from the data queue: raised when the queue
+   dropped. ~~A lane that already holds 256 RPCs (`priority_max`) refuses the next one and reports an
+   overflow once.~~ *(Superseded by "Priority lane overflow joins the data queue" below.)* It also derives a *pressure* level from the data queue: raised when the queue
    reaches 256 data RPCs (`pressure_raise`) or a period at the cap starts, cleared when it is at 64 or
    fewer (`pressure_clear`) with no period running. `take_pressure_change` hands out each change once.
    `SendQueueStats` (queued data RPCs and dropped count, atomics shared with the behaviour) and
    `SendQueueSnapshot` serve the metrics.
 2. **`src/handler.rs`** -- `HandlerIn::PriorityMessage` queues into the lane. `HandlerEvent`
-   gains `SendQueuePressure { raised }`, emitted from `poll`; a lane overflow is reported as
-   `SendQueueStuck` (the behaviour closes the connection) with a log line naming the peer.
+   gains `SendQueuePressure { raised }`, emitted from `poll`. ~~A lane overflow is reported as
+   `SendQueueStuck` (the behaviour closes the connection) with a log line naming the peer.~~ *(Superseded
+   by "Priority lane overflow joins the data queue" below.)*
 3. **`src/behaviour.rs`** -- `publish_with_priority`, `publish_from_with_priority` and
    `propagate_message_with_priority` mark every copy of the message they write as priority
    (`forward_msg`, `send_message` and `notify_primary` take the mark; all other callers pass
@@ -160,6 +163,69 @@ cancellations and swap negotiation messages must not wait behind queued order up
 in `src/behaviour/tests.rs`, run with the filter `test_priority_ test_send_queue_ test_relay_mesh_join`;
 in-process tests in `mm2_p2p/tests/gossip_send_queue.rs`.
 
+## Priority lane overflow joins the data queue (not security-related)
+
+An amendment to the priority lane above: CRD ch.28 §28.9B RQ1 item 9 "Own cap" as amended 2026-10-30
+(Reloaded-original). The wire is unchanged.
+
+**Why.** A burst of more priority messages than the lane holds is normal (a maker cancelling all of its
+orders). Closing the connection on a full lane closed several relay links of a seed in the same second
+in a field run.
+
+**What changed.**
+
+1. **`src/send_queue.rs`** -- `push_priority(rpc, now)` queues into the lane while it holds fewer than
+   `priority_max` RPCs. A full lane sends the RPC to the end of the data queue through the same path as
+   `push`: it counts toward the data cap, may evict the oldest data RPCs and updates the pressure level
+   and the period at the cap, so a spill alone never makes a connection stuck. The result is
+   `PriorityPush::Queued` or `PriorityPush::Spilled { drop_log, spill_log }`. `SpillLog` is rate limited
+   per connection like `DropLog`: `First` for the first spill, then at most one `Summary { moved }` per
+   `stuck_timeout` (60 s), carrying the count since the last report. A count that is not yet reported
+   stays until the next spill at or after the period and is lost if the connection ends first.
+   `priority_overflow` and `take_priority_overflow` are removed.
+2. **`src/handler.rs`** -- `push_to_priority_lane` logs `First` and `Summary` at INFO, naming the peer, and
+   any `DropLog` as the data path does. No message content. `poll_send_queue_stuck` reports only the
+   at-cap deadline; `SendQueueStuck` no longer comes from the priority lane.
+3. **`src/behaviour.rs`** -- no change.
+
+**Tests.** Seven unit tests in `send_queue.rs` (spill position and pop order, the 257th at the default,
+eviction, pressure and period, report rate limit, unreported count, no stuck report), one handler test
+(`priority_messages_go_to_the_priority_lane_and_overflow_joins_the_data_queue`, replaces the close test),
+and `rq1_priority_lane_overflow_joins_the_data_queue` in `mm2_p2p/tests/gossip_send_queue.rs` (600
+priority RPCs toward a paused peer).
+
+## Log levels (not security-related)
+
+Log lines only; behavior and wire are unchanged.
+
+1. **`src/behaviour.rs`** -- `propagate_message_with_priority` and `report_message_validation_result` log
+   a message that is no longer in the message cache at DEBUG, not WARN. On a relay the gossip layer already
+   forwarded the message on receipt, so the missing application-level (second) forward loses nothing. The
+   metrics call is kept.
+2. **`src/relay_mesh_report.rs`, `src/behaviour.rs`** -- `maintain_relays_mesh` (every 10 s) logs the relay
+   mesh below its low watermark, and above its high watermark, at INFO the first time, on every change of the
+   mesh size, and as a reminder every 10 minutes while the size stays; DEBUG otherwise. The text names the
+   mesh size, the watermark and (low only) the number of connected relays.
+
+## Validate without forwarding (not security-related)
+
+For CRD ch.32 §32.8 R-F3b (amended, D11): a relay sends the application-level second copy of an
+orderbook message only when the message is priority. The wire is unchanged.
+
+**Why.** `propagate_message` does two things: it marks the cached message validated, and it
+forwards it. Only validated messages are announced in IHAVE or served for IWANT. A relay that skips
+the second copy must still validate the message, or its gossip announcements and IWANT answers
+would change.
+
+**What changed.** `src/behaviour.rs` gains `validate_message_without_forwarding(&mut self,
+message_id) -> bool`. It marks the cached message validated (`mcache.validate`) and returns whether
+it was found; a miss is logged at debug and counted as a memcache miss, like
+`propagate_message_with_priority`. It forwards nothing and changes no other state.
+
+**Tests.** `test_validate_message_without_forwarding` in `src/behaviour/tests.rs`: no
+`NotifyHandler` event is queued, the message then appears in the gossip message ids of its topic, a
+miss returns false.
+
 ## Manifest changes (not security-related)
 
 The fork declares deps through `[workspace.dependencies]`, which does not resolve
@@ -182,8 +248,10 @@ resolve fresh.
 ## Test status
 
 `cargo test --manifest-path vendor-patches/libp2p-gossipsub-0.45.0/Cargo.toml --lib`
-→ **158 passed, 6 failed** (124 passed before the send queue change added 15 tests, and 13 more with
-the pressure signal and the priority lane, and 6 more with the queue signal).
+→ **168 passed, 6 failed** (124 passed before the send queue change added 15 tests, and 13 more with
+the pressure signal and the priority lane, 6 more with the queue signal, 3 more with the relay mesh
+log levels, 6 more with the priority lane overflow change: 7 added, 1 replaced, and 1 more with
+validate-without-forwarding).
 
 Those 6 (`test_flood_publish`, `do_forward_messages_to_explicit_peers`,
 `test_do_not_use_floodsub_in_fanout`, `test_publish_to_floodsub_peers_without_flood_publish`,
