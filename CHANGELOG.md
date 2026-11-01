@@ -214,7 +214,15 @@ it and, where one exists, the CRD rule, for readers who want more.
   of always to the first, so an order-posting burst can use the request budget of every connected
   server. Broadcasts, subscriptions and pings are routed as before, and a query whose server fails
   moves on to the others. Set `electrum_spread_reads` to `false` to restore GLEEC KDF behavior, where
-  every query goes to the highest-ranked connected server first. Detail: PR #128; CRD ch.38 R38.6.4a.
+  every query goes to the highest-ranked connected server first. Spreading sends one read in N to
+  each of N connected servers, a slow or distant one included. On a list with one such server, a loop
+  of balance reads and order posts can be slower than before: in a lab loop of 200 RIN orders, one
+  server about nine times slower than the other two made the loop 48 % longer. To avoid it, remove
+  distant servers from the coin's list, or set `electrum_spread_reads` to `false` and
+  `electrum_server_order` to `listed`, which sends every read to the first listed server. Leave it on
+  where the servers limit each session, as DOGE's do: there every order post draws on the budget of
+  every connected server. More in [`order-posting-latency`](docs/plans/order-posting-latency.md).
+  Detail: PR #128; CRD ch.38 R38.6.4a.
 - **Fixed-fee UTXO coins now pay their `txfee` per kilobyte proportionally, as the reference does.**
   Every coin with a nonzero `txfee`, or none, used to pay the whole per-kilobyte fee for every
   started kilobyte, so a 226-byte KMD transaction cost 1,000 base units instead of 226. Withdrawals,
@@ -222,8 +230,9 @@ it and, where one exists, the CRD rule, for readers who want more.
   forces the node's minimum relay fee pays that rate proportionally as well. A segwit transaction's
   size is its virtual size rounded up, as nodes count it, so a fee at the relay minimum is never one
   unit short. Swap spends and refunds are estimated over 496 bytes instead of 305 bytes rounded up
-  to a whole kilobyte: a KMD spend costs 496. An explicit `UtxoFixed` withdraw fee keeps its
-  meaning. Detail: PR #72; CRD ch.38 R38.6.6b–c.
+  to a whole kilobyte: a KMD spend costs 496. An explicit `UtxoFixed` withdraw fee is still charged
+  for every started kilobyte, which the reference does not do (see Known limitations). Detail:
+  PR #72; CRD ch.38 R38.6.6b–c.
 - **The coins-file option `dingo_fee` is now honored.** With `dingo_fee: true` and a positive
   `txfee`, a coin pays `txfee` for every started kilobyte. DINGO, DEV, NYC, SHIC, TRMP and XVG carry
   it. Their version-two swap spend fee is now one `txfee`, matching a reference peer that validates
@@ -516,6 +525,20 @@ it and, where one exists, the CRD rule, for readers who want more.
   `orderbook.history.evicted`. More in
   [`orderbook-queue-and-history-caps`](docs/plans/orderbook-queue-and-history-caps.md). Detail:
   PR #164; CRD ch.32 R-K5, R-K6.
+- **On Linux the daemon now limits the memory allocator to two arenas at start-up.** The system's
+  memory allocator (glibc) gives each thread that allocates an area of its own, and the daemon runs
+  from about 30 threads on an 8-core host to several hundred on a many-core one. Memory freed in
+  one area is mostly not reused by the others, so a maker that updated hundreds of orders every few
+  seconds held steadily more memory although the data it holds stayed the same. In tests a maker
+  with 480 orders on 16 pairs, updating about 80 times a second, grew by about 1 MB a minute with
+  the allocator's own default and stopped growing with two arenas, with no change in update rate or
+  processor use. The limit applies only to the daemon on Linux with glibc, not to the embedded
+  library or other systems, and the start-up log has one line that says where the limit came from.
+  Set the environment variable `MALLOC_ARENA_MAX` to choose your own (the daemon then leaves the
+  allocator alone), or the `MM2.json` whole number `malloc_arena_max`; `0` keeps the allocator's own
+  default, and an invalid value is reported and replaced by `2`. Its effect on swaps and coin
+  activation is not measured yet. Detail: issue #191;
+  [`malloc-arena-cap`](docs/plans/malloc-arena-cap.md); CRD ch.45 R45.6A.
 - **Peer exchange keeps the usable addresses of a peer list.** Nodes ask each other for peer
   addresses every five minutes. Some peers that do not run Reloaded include the hostname under which
   they reached a seed, such as `/dns/seed04.kmdefi.net/tcp/42845`. Reloaded used to throw away the
@@ -1137,12 +1160,34 @@ lives.
   coin is offered only once the Electrum server lists it. More in
   [`withdraw-entry-expiry-by-block-time`](docs/plans/withdraw-entry-expiry-by-block-time.md).
   Detail: PR #181; CRD ch.38 R38.5B.8, D38.5B.2, D38.5B.4.
+- **A withdrawal with an explicit fixed fee can cost more than on Komodo or GLEEC KDF.** When a UTXO
+  `withdraw` gives its fee as `{"type":"UtxoFixed","amount":…}`, KDF Reloaded charges that amount for
+  every started kilobyte of the transaction, while Komodo and GLEEC KDF charge it in proportion to
+  the size. For the same request, a 245-byte KMD withdrawal paid the whole fee here and about a
+  quarter of it on the reference, and a 1,404-byte DOGE withdrawal paid twice the fee here and about
+  1.4 times it there. You never pay less than the fee you entered, and a withdrawal without `fee`,
+  swaps and the DEX fee are not affected. Parity is planned after the beta. More in the
+  [GLEEC compatibility guide](docs/GLEEC_COMPATIBILITY.md). Detail: PR #72.
 - **The swap watcher does not work yet.** A watcher is another node that finishes a swap for you
   when you are offline. No swap hands its data to a watcher yet, for any coin (issue #56), so keep
   your node running until your swaps have finished. Bitcoin-family coins (UTXO coins such as RIN,
   BCH and QTUM) also no longer offer to watch other traders' swaps, because the checks a watcher
   runs are not implemented for them; only Siacoin (SC) offers watching. Detail: PR #177; CRD ch.09
   R17.
+- **A maker that changes its orders many times a second can drop out of the order book of a relay
+  with a slow link.** In a test, a node that kept 480 orders and changed their prices about 80 times
+  a second sent its updates to a GLEEC KDF relay whose incoming link was limited to 100 kbit/s. Within
+  2 to 4 minutes the orders were gone from that relay's order book, and from the nodes behind it, for
+  the rest of the test; the maker itself reported no errors. Setting the `MM2.json` boolean
+  `maker_update_coalescing` to `true` kept all 480 orders visible in the same test. It is off by
+  default because it has a cost: price changes reached other nodes about 20 to 25 seconds later, for
+  5 minutes after the relay fell behind other nodes learned changes only through the keep-alive
+  synchronization, and the relay logged 6 to 18 failed order-book synchronization requests a minute.
+  More in [`maker-gossip-rate-control`](docs/plans/maker-gossip-rate-control.md). Detail: CRD ch.32
+  D9.
+- **Other nodes can keep showing a cancelled order for a while if its cancellation is lost on the
+  way.** Such an order cannot be matched or traded, and it disappears once the maker posts again on
+  that pair or goes offline. Detail: PR #188; CRD ch.32 D12.
 - **ARRR (Pirate) atomic swaps work only between two KDF Reloaded nodes.** ARRR now uses a newer
   transaction format (v6, from the Ironwood upgrade) that no other KDF implementation can handle, so a
   swap with a Komodo or GLEEC counterparty cannot complete. A swap between two KDF Reloaded nodes has
