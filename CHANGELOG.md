@@ -6,6 +6,200 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+<!-- How to add an entry: put it under the matching ### group and #### area (add the area heading if it is missing), as a bold one-sentence summary in plain words, then the detail, ending with "Detail: PR #N; CRD ch.X RY". -->
+<!-- The same PR updates every affected document: the CRD chapter, the plan body and its "Plans touched" row, RELOADED_VS_GLEEC.md, docs/GLEEC_COMPATIBILITY.md and "Known limitations" below; a plan's Status line is left to the maintainer. -->
+
+Within each heading, entries are grouped by area. Each entry ends with the pull request that made
+it and, where one exists, the CRD rule, for readers who want more.
+
+### Added
+
+#### EVM coins
+
+- **The log shows the gas limits each EVM coin and token will use.** At activation, one line names
+  where the coin's gas limits come from: its own entry in the coins file, its platform coin's entry,
+  or the built-in defaults. It lists the values that differ from the defaults, and the gas-estimate
+  multiplier when one is set; the full list is logged at debug level. A coins file that lacks the
+  limits a chain needs is now visible at once, as it was not when Monad token swaps ran out of gas
+  with a coins file older than October 28, 2026. Detail: PR #200; CRD ch.57 R57.5.5.
+
+#### Start-up and configuration
+
+- **The start-up log now lists the files the node uses.** At start the node logs, at INFO and as
+  absolute paths, where its configuration came from (the command line, the default file or the file
+  named by `MM_CONF_PATH`), where its coins list came from, the log file, the database folders and the
+  wallet file it reads, so a node started from the wrong folder shows it at once. It never logs file
+  contents or configuration values, and no WSS certificate or key path. Detail: PR #209; CRD ch.45 R45.6.6.
+
+### Changed
+
+#### Order book and peer-to-peer network
+
+- **A node waits 5 minutes before it dials the same address again, and no longer dials a seed it
+  is already connected to.** A node that holds fewer relays than it needs dials seeds and known
+  peers every 30 seconds.
+  - **Repeated dials.** An address that did not answer used to be dialed again at every round,
+    about 120 times an hour. It is now dialed at most once per 5 minutes, as GLEEC KDF does. A
+    seed that drops a connection soon after it was made is therefore redialed up to 5 minutes
+    later, not 30 seconds later.
+  - **A loop with seeds.** A seed that had connected to the node by itself was dialed a second
+    time at every round, because the node compared addresses only. The second connection went
+    unused and closed after two minutes, so the cycle repeated every 2.5 minutes for as long as
+    the node was short of relays. The node now remembers which peer each seed address reached
+    and does not dial the address while that peer is connected.
+  - **Log.** The warning "P2P relays below low watermark" appears at most once per 5 minutes
+    while the number of connected relays stays the same.
+
+  Nothing changes on the wire. Detail: PRs #199, #206; CRD ch.28 R27a.
+- **A relay holds more sync requests for a maker it is still catching up on.** During a burst, for
+  example after several makers restart, a relay now holds up to 32 such requests per asking node and
+  2,048 in all (before: 8 and 256) and answers them when its own sync lands, instead of answering
+  with an error at once. The limits are the `MM2.json` settings `sync_answer_deferral_max_per_peer`
+  and `sync_answer_deferral_max_total` (at most 64 and 8,192). Nothing on the wire changes. Detail:
+  PR #205; CRD ch.32 R-Q5b.
+
+#### UTXO coins and Electrum
+
+- **Electrum reads now go only to the servers with the shortest round trip.** Since 0.3.0-beta.1
+  a coin's read-only Electrum queries took turns over every connected server, so a distant server
+  in the list answered one read in N. Now they take turns only among the connected servers whose
+  recent round trip is at most twice the fastest one's, or within 20 ms of it. The others still
+  answer when those fail, and come back into the turn once their round trip is short again. The
+  round trip is measured from answers the node already gets; nothing extra is sent. From the lab
+  host, RIN's six servers answered a balance read in 25 to 266 ms: spread over all six that
+  averages about 114 ms per read, and over the three this rule keeps, about 28 ms. When every
+  server slows down, as under a per-session limit, all of them stay in the turn. The `MM2.json`
+  numbers `electrum_spread_near_factor` (default `2`) and `electrum_spread_near_offset_ms` (default
+  `20`) set the factor and the margin; a factor of `0` spreads over every connected server as
+  before. Detail: PR #215; CRD ch.38 R38.6.4a.
+
+### Fixed
+
+#### Node names in logs and errors
+
+- **A node URL that a lower layer writes in another spelling is now shortened to scheme, host and
+  port as well.** Before, an error text from the HTTP client, TLS or the browser lost a node's URL
+  only when it repeated the URL exactly as configured. Now a copy that is percent-encoded, in
+  another letter case, with a default port added or dropped, or with a trailing slash added also
+  loses its userinfo, path and query, on the native and the browser (WASM) build. Such a URL keeps
+  the scheme and port the lower layer wrote, and a URL of another host is left as it is. The
+  `mm2_net` crate now also builds on its own for the browser target. Detail: PR #218; CRD ch.35
+  R35.1.14.
+
+### Tests
+
+- **The tests run before the next beta will be listed in
+  [`docs/release-tests/0.4.0-beta.1.md`](docs/release-tests/0.4.0-beta.1.md).**
+
+### Plans touched
+
+Every plan this release touched in any sense since v0.3.0-beta.1, with what happened to it. Each plan
+file carries the detail. "New" means the plan was created in this cycle.
+
+- [`evm-swap-gas-multiplier`](docs/plans/evm-swap-gas-multiplier.md) — blocked: the activation log
+  now names the gas limits each EVM coin and token will use and where they come from (PR #200);
+  options (a) and (b) still wait on the reference maintainers' outcome.
+- [`ghost-orders`](docs/plans/ghost-orders.md) — new, planning: cancelled orders that other nodes keep
+  showing after a lost cancellation; five work packages after the beta, the first being the higher
+  sync limits on relays above (PR #205). What two later packages waited for is now recorded: how a
+  cancelled order can come back on Komodo and GLEEC KDF, and that their makers advertise every
+  non-empty pair at every tick (PR #222).
+- [`order-posting-latency`](docs/plans/order-posting-latency.md) — in progress: the rule that
+  spreads read-only Electrum queries only over the servers with the shortest round trip is written,
+  with its two switches and their defaults (PR #201), and implemented (PR #215); the SwapLab timing
+  rows are next.
+- [`p2p-dialing-and-discovery`](docs/plans/p2p-dialing-and-discovery.md) — new: the peer-to-peer
+  items of 0.4.0. The redial guards are in (PRs #199, #206).
+- [`trading-floors-parity`](docs/plans/trading-floors-parity.md) — in progress: how Komodo and
+  GLEEC KDF charge an explicit `UtxoFixed` withdraw fee (in proportion to the size) is now
+  recorded; whether KDF Reloaded follows them stays the maintainer's decision (PR #222).
+
+### Known limitations
+
+What does not work yet, or works only in part, in this release. Each item says where more detail
+lives.
+
+- **Do not run two KDF instances on the same seed at the same time.** If you do, for any coin (RIN
+  included), both instances can pick the same funds for two different transactions. The network
+  accepts one and rejects the other, and the instance that loses gets no explanation and may try
+  again. KDF guards against this inside a single instance only; shielded coins such as ARRR are the
+  known case. More in [`shielded-in-flight-note-locking`](docs/plans/shielded-in-flight-note-locking.md).
+- **A withdrawal that drops out of the mempool keeps its coins set aside until the coin is enabled
+  again or the node restarts.** Once a withdrawal's broadcast is accepted, the node no longer offers
+  the coins it spent, so the next withdrawal does not pick them again, and it offers the change
+  instead. If the transaction later leaves the mempool unconfirmed, for example because its fee was
+  too low or it was replaced, those coins stay set aside and its change stays offered, so a
+  withdrawal that picks that change can fail. Disabling and enabling the coin again, or restarting
+  the node, clears this. In an HD wallet, change that a withdrawal sends to another address of the
+  coin is offered only once the Electrum server lists it. More in
+  [`withdraw-entry-expiry-by-block-time`](docs/plans/withdraw-entry-expiry-by-block-time.md).
+  Detail: PR #181; CRD ch.38 R38.5B.8, D38.5B.2, D38.5B.4.
+- **A withdrawal with an explicit fixed fee can cost more than on Komodo or GLEEC KDF.** When a UTXO
+  `withdraw` gives its fee as `{"type":"UtxoFixed","amount":…}`, KDF Reloaded charges that amount for
+  every started kilobyte of the transaction, while Komodo and GLEEC KDF charge it in proportion to
+  the size. For the same request, a 245-byte KMD withdrawal paid the whole fee here and about a
+  quarter of it on the reference, and a 1,404-byte DOGE withdrawal paid twice the fee here and about
+  1.4 times it there. You never pay less than the fee you entered, and a withdrawal without `fee`,
+  swaps and the DEX fee are not affected. Parity is planned after the beta. More in the
+  [GLEEC compatibility guide](docs/GLEEC_COMPATIBILITY.md). Detail: PR #72.
+- **The swap watcher does not work yet.** A watcher is another node that finishes a swap for you
+  when you are offline. No swap hands its data to a watcher yet, for any coin (issue #56), so keep
+  your node running until your swaps have finished. Bitcoin-family coins (UTXO coins such as RIN,
+  BCH and QTUM) also no longer offer to watch other traders' swaps, because the checks a watcher
+  runs are not implemented for them; only Siacoin (SC) offers watching. Detail: PR #177; CRD ch.09
+  R17.
+- **A maker that changes its orders many times a second can drop out of the order book of a relay
+  with a slow link.** In a test, a node that kept 480 orders and changed their prices about 80 times
+  a second sent its updates to a GLEEC KDF relay whose incoming link was limited to 100 kbit/s. Within
+  2 to 4 minutes the orders were gone from that relay's order book, and from the nodes behind it, for
+  the rest of the test; the maker itself reported no errors. Setting the `MM2.json` boolean
+  `maker_update_coalescing` to `true` kept all 480 orders visible in the same test. It is off by
+  default because it has a cost: price changes reached other nodes about 20 to 25 seconds later, for
+  5 minutes after the relay fell behind other nodes learned changes only through the keep-alive
+  synchronization, and the relay logged 6 to 18 failed order-book synchronization requests a minute.
+  More in [`maker-gossip-rate-control`](docs/plans/maker-gossip-rate-control.md). Detail: CRD ch.32
+  D9.
+- **Other nodes can keep showing a cancelled order for a while if its cancellation is lost on the
+  way.** Such an order cannot be matched or traded, and it disappears once the maker posts again on
+  that pair or goes offline. More in [`ghost-orders`](docs/plans/ghost-orders.md). Detail: PR #188;
+  CRD ch.32 D12.
+- **ARRR (Pirate) atomic swaps work only between two KDF Reloaded nodes.** ARRR now uses a newer
+  transaction format (v6, from the Ironwood upgrade) that no other KDF implementation can handle, so a
+  swap with a Komodo or GLEEC counterparty cannot complete. A swap between two KDF Reloaded nodes has
+  completed on the live chain, including the spend of the locked ARRR (October 2026). More in
+  [`arrr-ironwood-compatibility`](docs/plans/arrr-ironwood-compatibility.md).
+- **Shielded coins such as ARRR cannot be activated in a browser (WASM) build.** Activation ends with
+  an error saying shielded activation is not available in the WebAssembly build: the browser build
+  has no shielded wallet database, and building a shielded transaction would also need the Sapling
+  prover, which only the native build has. Use a native build for ARRR. Detail: CRD ch.39 R39.10.1,
+  §39.6.1.
+- **Siacoin (SC) swaps are not available.** Sending, receiving, the balance and the history work.
+  Atomic swaps of SC are postponed until after the beta; the design is still a draft. More in the
+  [Siacoin swap draft](docs/reloaded-rewrite/54-sia-swap-v2-path.md).
+- **Radiant (RXD) is only partly usable.** RXD activates and signs, but swaps with it are not
+  established. More in
+  [`rxd-signature-version-support`](docs/plans/rxd-signature-version-support.md).
+- **TRON (TRX, TRC20) and Solana (SOL, SPL) cannot be activated in this beta.** Their support is not
+  finished. TRON activation answers "TRON support is not available in this build";
+  `enable_solana_with_tokens` and `enable_spl` answer "Solana support is not available in this
+  build"; the rest of the node is unaffected. Both are planned to return in the next beta. More in
+  [`tron-support`](docs/plans/tron-support.md) and [`solana-support`](docs/plans/solana-support.md).
+  Detail: PR #93.
+- **Tendermint (Cosmos) coins are wallet-only in this beta.** Activation, balances and withdrawals
+  work; orders and swaps are planned to return in a later release. A swap already in progress still
+  completes, and an order with a Tendermint coin saved by an earlier version is cancelled at startup.
+  More in [`tendermint-activation-features`](docs/plans/tendermint-activation-features.md). Detail:
+  PR #93.
+- **Swaps of Monad tokens need a coins file from October 28, 2026 or later.** On Monad, a token's
+  swap payment needs more gas than the default limit of 150000 (about 158000 for USDC-MON). Coins
+  files from that date on give each Monad token, such as USDC-MON, its own `gas_limit` block, which
+  KDF Reloaded uses. With an older file the payment runs out of gas and fails on-chain: its gas fee
+  is spent, the tokens stay in the wallet and the swap stops. A counterparty whose payment is already
+  locked gets it back by refund once the swap's lock time passes. With an older file, the token's
+  activation log line says `gas_limit: defaults`. More in
+  [`evm-swap-gas-multiplier`](docs/plans/evm-swap-gas-multiplier.md). Detail: PR #105, PR #200; CRD
+  ch.57 R57.5.2, R57.5.3, R57.5.5.
+
 ## [0.3.0-beta.1] — 2026-11-01
 
 Within each heading, entries are grouped by area. Each entry ends with the pull request that made
@@ -1143,6 +1337,10 @@ file carries the detail. "New" means the plan was created in this cycle.
   #148), with defaults measured in the lab (PR #159) and the follow-ups done (PR #160). After a
   field run it became opt-in (PR #166); the plan lists what comes before it is the default again,
   and two deferred items await field data.
+- [`malloc-arena-cap`](docs/plans/malloc-arena-cap.md) — new, in progress: a maker's memory growth
+  under heavy order updates was traced to the system allocator keeping freed memory, and on Linux the
+  daemon now limits the allocator to two arenas at start-up (PRs #189, #190); a longer run at a lower
+  update rate and the sizing of the executors are left (issue #191).
 - [`my-orders-speed`](docs/plans/my-orders-speed.md) — new and done: `my_orders` answers about 4 to
   12 times faster with 2,000 orders (PR #154).
 - [`order-posting-latency`](docs/plans/order-posting-latency.md) — new, in progress: posting orders

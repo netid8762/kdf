@@ -1,6 +1,6 @@
-# KDF Reloaded v0.1.0-alpha.1 — Comparison to GLEEC KDF v\<X.Y.Z\>
+# KDF Reloaded 0.3.0-beta.1 — Comparison to GLEEC KDF 3.0.0-beta
 
-> **Status: skeleton.** Detail sections will be filled in as v0.1.0-alpha.1 is finalised. The summary lists below are the authoritative public catalogue of differences once the alpha is tagged.
+> The lists below are the public catalogue of differences as of KDF Reloaded 0.3.0-beta.1.
 
 ## What is KDF Reloaded?
 
@@ -147,6 +147,12 @@ The developer-facing rule (mandatory for AI assistants, strong recommendation fo
   the reference behavior. Nothing a counterparty observes changes, so the
   divergence is the default; the shared registry needs no change. See CRD ch.37
   R37.5.9e and [`docs/GLEEC_COMPATIBILITY.md`](docs/GLEEC_COMPATIBILITY.md).
+- **EVM coins and tokens log the gas limits they will use.** At activation, one
+  INFO line names where each gas-limit block comes from (the coin's own entry,
+  its platform coin's entry or the defaults) and lists the members that differ
+  from the defaults, with the gas-estimate multiplier when one is set; a DEBUG
+  line lists every member. It is logging only: no request, response or
+  transaction changes, so no switch exists. See CRD ch.57 R57.5.5.
 
 ### Behavioural divergences without a compatibility switch
 
@@ -330,6 +336,36 @@ These are divergences from GLEEC KDF that are **not** operator-configurable in t
   Contract: [CRD ch.37 §37.5.1](docs/reloaded-rewrite/37-utxo-spv-and-block-header-validation.md)
   (the key-absent row and the port note under §37.5.8). Code:
   `coins/utxo/header_layout_fallback.rs`, `coins/utxo/utxo_builder/utxo_conf_builder.rs`.
+- **A seed that is already connected is not dialed again.** A node short of relays dials each
+  address at most once per 5 minutes, as GLEEC KDF does. GLEEC KDF also dials a seed that has
+  connected to it by itself, because it compares addresses only, and the extra connection closes
+  unused after two minutes. KDF Reloaded remembers which peer each seed address reached and does
+  not dial it while that peer is connected. Nothing changes on the wire; no switch. Contract:
+  [CRD ch.28 R27a](docs/reloaded-rewrite/28-libp2p-modernization.md). Code:
+  `mm2_p2p/src/redial_guard.rs`.
+
+- **An explicit `UtxoFixed` withdraw fee for a UTXO coin is charged per started
+  kilobyte, with no switch.** A UTXO `withdraw` with
+  `fee: {"type":"UtxoFixed","amount":"<n>"}` pays `<n>` for every started kilobyte of
+  the transaction in Reloaded. The reference (Komodo DeFi Framework 2.6.0-beta and
+  GLEEC KDF 3.0.0-beta) charges `<n>` as a rate per 1,000 bytes, in proportion to the
+  size and rounded down, exactly like `UtxoPerKbyte`, so it pays less than `<n>` for
+  any transaction under a kilobyte. Reloaded never pays less than the fee entered. No
+  other node sees the difference, because a withdrawal is the node's own transaction.
+  Measured values are in [`docs/GLEEC_COMPATIBILITY.md`](docs/GLEEC_COMPATIBILITY.md);
+  parity is planned after the beta
+  ([`docs/plans/trading-floors-parity.md`](docs/plans/trading-floors-parity.md)).
+  Contract: [CRD ch.38 R38.6.6l](docs/reloaded-rewrite/38-utxo-coin-maintenance-and-features.md).
+
+- **Reloaded never writes a cancelled order's stored record back, with no switch.**
+  On the reference, an order update or the node's own match-pruning step that runs
+  into a concurrent cancel can write the cancelled order's stored record back. The
+  order then returns as a live order at the next start and is announced to other
+  nodes again. Reloaded never writes the record of an order once it has been removed.
+  An order whose record could not be deleted at cancel time still comes back after a
+  restart on both, because the failed deletion is logged and not retried. Contract:
+  [CRD ch.12 R7b](docs/reloaded-rewrite/12-order-match-state-store.md),
+  [ch.32 R-GH11](docs/reloaded-rewrite/32-orderbook-p2p-and-trie.md).
 
 ### Removed / disabled in KDF Reloaded
 
@@ -354,7 +390,6 @@ These are divergences from GLEEC KDF that are **not** operator-configurable in t
   completes or is recovered. Orders and swaps are planned to return in a later
   release. No switch exists: the build constant `TENDERMINT_SWAPS_AVAILABLE`
   (`coins/lp_coins_ops.rs`) is `false`.
-- *(further entries to be enumerated as the alpha is finalised.)*
 
 ### Work in progress
 
@@ -363,13 +398,11 @@ These are divergences from GLEEC KDF that are **not** operator-configurable in t
   own ed25519 HTLC key (ch.51 R-S9), gets the CRD-dictated 32-byte secret
   hash whenever it is on either side of the pair (ch.51 R71/R72), and has
   completed real send/spend/refund swaps against UTXO counterparties
-  (confirmed live, both directions). Still open: the swap-spend search
-  event-walk remains unimplemented (ch.20 D3/R-S8 — the affected RPC now
-  fails cleanly instead of silently guessing "not spent", but does not yet
-  actually search), and the V2 swap protocol is not implemented for SC
-  (ch.20 D5, V1 only).
+  (confirmed live, both directions). The swap-spend search walks the HTLC
+  address's event log and tells a spend from a refund (ch.20 D3, closed).
+  Still open: the V2 swap protocol is not implemented for SC (ch.20 D5,
+  V1 only).
 - HD wallet dispatch in swap/ordermatch paths (legacy iguana-key fallback retained for parity with upstream and GLEEC; documented in code).
-- *(further entries to be enumerated.)*
 
 ### Settings to set for GLEEC-compatible operation
 
@@ -468,7 +501,9 @@ switch. The value below gives the GLEEC-compatible behavior; the row of each swi
 - `fee_estimate_cache_secs: 0`, with no per-coin value — no fee reading is reused between
   requests.
 - `electrum_spread_reads: false` — every read-only Electrum query goes to the highest-ranked
-  connected server first.
+  connected server first. The near factor `electrum_spread_near_factor` and the near offset
+  `electrum_spread_near_offset_ms`, which limit spreading to the servers with the shortest round
+  trip, then have no effect.
 - `electrum_server_order: "listed"` — a coin's Electrum servers are ranked in the order they are
   listed instead of by a random draw.
 - `orderbook_sync_names_held_root: false` — a sync request names the root the maker advertised
@@ -478,6 +513,8 @@ switch. The value below gives the GLEEC-compatible behavior; the row of each swi
   answered at once.
 - `sync_request_retry_ms: 0` — a failed sync request of this node is not asked again before the
   maker's next keep-alive.
+- `sync_request_alternate_relay: false` — a failed or outdated sync answer is not followed by a
+  request to another relay before the maker's next keep-alive.
 - `relay_second_copy_priority_only: false` — a relay sends every message it forwards a second
   time, not only cancellations, swap negotiation and messages outside the order book.
 - `p2p_resolve_peer_hostnames: false` — a hostname a peer gives in its list of peer addresses is
