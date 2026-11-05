@@ -39,9 +39,11 @@ required-but-unimplemented extensions). Mixed treatment -- see §39.0.
   coin's Ironwood activation height, which is configured or discovered at runtime
   (R39.6.4e). The swap freeze (R39.6.4b) and the build refusal (R39.6.4c) are
   therefore inert in this build. What remains unverified without a broadcast is
-  stated in R39.6.4e's status note.
-- **§39.6.5 Pirate1 withdrawals and R39.8.0bb Ironwood deposits (v0.4.0, specified
-  2026-11-04, not implemented):** the wallet stays Sapling-only, receives Sapling
+  stated in R39.6.4e's status note. From v0.4.0 an ARRR swap also requires the
+  counterparty to declare that it builds version 6 (R39.6.4f, implemented 2026-11-05 in
+  PR #241).
+- **§39.6.5 Pirate1 withdrawals and R39.8.0bb Ironwood deposits (v0.4.0, implemented
+  2026-11-05 in PR #242 and PR #246):** the wallet stays Sapling-only, receives Sapling
   outputs inside transactions that also carry Ironwood actions (R39.8.0bb), and can
   pay a Pirate1 (Ironwood) address from its Sapling notes (R39.6.5a--R39.6.5i).
 - **§39.11 (Part E -- implemented in part):** `lightwalletd` as the **sole**
@@ -1082,9 +1084,9 @@ no Ironwood height anywhere shall keep constructing version 4 at every height.
   `0x00` for the Orchard slot, and an empty Ironwood bundle**. Sapling survives inside
   version 6; this project builds neither an Orchard nor an Ironwood bundle, so the build
   configuration carries no Orchard or Ironwood anchor. *(Exception from v0.4.0,
-  2026-11-04: a withdrawal to a Pirate1 address carries an Ironwood bundle of output
-  actions and an Ironwood anchor, R39.6.5d--R39.6.5e. Every other transaction keeps
-  the empty Ironwood bundle.)* The transaction identifier is the
+  2026-11-04: a withdrawal to a Pirate1 address carries an output-only Ironwood bundle,
+  with spends disabled and the empty-tree anchor, R39.6.5d--R39.6.5e. Every other
+  transaction keeps the empty Ironwood bundle.)* The transaction identifier is the
   ZIP-244 digest, not a double-SHA256 of the bytes; a Sapling signature is made over the
   shielded signature hash (equal to the identifier for a transaction with no transparent
   inputs).
@@ -1161,6 +1163,88 @@ no Ironwood height anywhere shall keep constructing version 4 at every height.
 > the known limits, the pre-activation quiet window is obsolete -- Ironwood has been active
 > on the main chain since height 4,161,185, so no new transaction is built near the
 > boundary -- and the unpersisted discovered height is deferred (D39.6.b).
+
+R39.6.4f **Counterparty version-6 capability (from v0.4.0).** An ARRR swap shall not start
+with a counterparty that does not declare that it builds version-6 transactions. This rule
+is the shielded coin's use of the capability word of
+[Chapter 59](59-legacy-ordermatch-negotiation.md) §59.4A, key `tx_v6`.
+
+- (a) **Sending.** A shielded coin that has an Ironwood upgrade -- an Ironwood activation
+  time or height known for it, whether configured, built-in or discovered (R39.6.4a,
+  R39.6.4d, R39.6.4e(a)) -- and a build that constructs version-6
+  transactions (R39.6.4e(f)) shall send the capability word with `tx_v6` set to `true`. It
+  goes after its unchanged first value, the encoded address format (R59.4A.1), and it is
+  sent at all times, not only inside the window of (b). A coin without an Ironwood upgrade
+  sends no word, so its protocol information stays byte for byte as before (R59.4A.4).
+- (b) **Requiring.** While the window is open, the coin's acceptance check shall decline a
+  counterparty whose protocol information does not declare `tx_v6` (R59.4A.2; absent,
+  empty, malformed or `false` all count as not declared). This is the predicate that the
+  swap freeze of R39.6.4b already uses, on both the taker's reservation path and the maker's
+  request path (R59.3.2, R59.4.3). The window is open when either:
+  - an Ironwood activation time is known for the coin (configured or built-in) and the wall
+    clock is at or past that time less the freeze margin of R39.6.4b; or
+  - an Ironwood activation height is configured or has been discovered (R39.6.4e(a)).
+
+  For ARRR on the main network the window is therefore always open. It is read from the
+  clock and the recorded height, not from the chain: the check runs without a network read,
+  as the freeze does.
+- (c) **Switch.** `consensus_params` may carry an optional boolean
+  `require_v6_counterparty`, default `true` and optional in both directions like the
+  members of R39.6.4a. With `false` the requirement of (b) does not apply; the coin still
+  sends its word. `ironwood_gate_disabled` (R39.6.4d) has no effect on this rule. The switch
+  is per coin, not node-wide, so it applies to every chain that shares the coin's
+  parameters, the test and regtest chains included.
+- (d) **Logs.** Each decline shall log one debug line naming the coin and the cause (no
+  word, a malformed word, or a word without `tx_v6`). In addition, at most one warning per
+  coin per hour shall report how many counterparties were declined since the previous
+  warning. The check does not see the counterparty's identity; the order and side of each
+  decline are logged by the order-match layer (R59.4A.6).
+- (e) **Effect.** A decline happens before any swap starts. No swap record exists,
+  nothing is paid, and no penalty applies (R59.4A.5). A swap already in progress is not
+  checked again. Who is declined: every node that sends no `tx_v6` word -- the reference
+  release rows, which build nothing the post-Ironwood chain accepts, and also Reloaded
+  0.3.0-beta.1, which builds version 6 but predates the word. Its users upgrade to trade
+  ARRR. The order book shows no capability flag; a more general flag is a later question
+  (Chapter 59 D5).
+
+> **Provenance (2026-11-04).** Reloaded-original, decided by the maintainer: the
+> capability word, its requirement with the switch on by default, beta-1 nodes declined,
+> and no order-book flag. Before this rule, an ARRR swap with a node that cannot build
+> version 6 started normally and failed at that node's first ARRR transaction. Depending on
+> the roles, our side then lost the DEX fee, had its ARRR locked until the refund, or both.
+> No peer-level signal can prevent that, because the counterparty
+> of a swap is never a connected peer (Chapter 59 §59.4A, rationale).
+>
+> **Compatibility.** `require_v6_counterparty: false` admits counterparties without the
+> word again. It does not make an ARRR swap with GLEEC KDF possible, because that node
+> builds nothing the post-Ironwood chain accepts. The reference publishes the bare
+> address-format descriptor for a shielded coin and accepts a value that extends it with
+> trailing bytes, so it matches our longer protocol information as before and never sends
+> the word itself (R39.5.14). The requirement is therefore enforced by this side's check
+> alone, in both roles. A reference taker sees a Reloaded maker's decline only as a
+> request that times out.
+>
+> **Status (2026-11-05).** Implemented (PR #241), with T39.6.4f (a)--(f) and one test on a
+> light-mode coin that sends, declines and accepts through the coin's own methods. The
+> three decline causes of (d) are told apart by a crate-internal classifier next to the
+> generic reader of Chapter 59 §59.4A, which leaves the reader's result unchanged.
+
+T39.6.4f *Counterparty version-6 capability.*
+- (a) The protocol information of an ARRR coin is its address-format bytes followed by the
+  word {`tx_v6`: `true`}. A shielded coin without an Ironwood upgrade sends its bytes
+  unchanged.
+- (b) Inside the window, a counterparty without the word, with an empty or absent
+  protocol information, with a malformed word, or with `tx_v6` `false` is declined. With
+  the word it is accepted, on both the reservation and the request path.
+- (c) Before the window opens (an activation time far ahead and no known height), a
+  counterparty without the word is accepted. A coin with only a configured height has the
+  window open.
+- (d) With `require_v6_counterparty` `false`, a counterparty without the word is accepted.
+  `ironwood_gate_disabled` `true` changes none of the outcomes above.
+- (e) Logs, with an injected clock: one debug line per decline, and at most one warning
+  per coin per hour carrying the count.
+- (f) The freeze of R39.6.4b still declines every counterparty for a build without
+  version-6 support, whatever the word says.
 
 R39.6.4 The shielded-coin builder shall source **all** of its Zcash
 network parameters, its shielded HD derivation path, and its sync checkpoint
@@ -1315,11 +1399,13 @@ transaction (R39.6.4e) made of:
 
 - Sapling spends of the selected wallet notes, selected, witnessed and anchored exactly
   as for a withdrawal to a Sapling address;
-- an Ironwood bundle of the Ironwood epoch -- its bundle version, its default flags and
-  the circuit of that epoch, never the insecure pre-NU6.2 circuit -- holding one output
-  to the recipient with an empty memo and no outgoing viewing key, padded to the default
-  minimum of two actions, so that every action carries a dummy spend;
-- the change, if any, as a Sapling output to the wallet's own address;
+- an output-only Ironwood bundle of the Ironwood epoch -- its bundle version and the
+  circuit of that epoch, never the insecure pre-NU6.2 circuit -- with spends disabled and
+  outputs enabled, holding one output to the recipient with an empty memo and no outgoing
+  viewing key, padded to the default minimum of two actions, each with the zero-value
+  dummy spend the circuit requires;
+- the change, if any, as a Sapling output to the wallet's own Sapling address: the
+  change of a Pirate1 withdrawal never enters the Ironwood pool;
 - no transparent inputs or outputs, and the empty Orchard slot of R39.6.4e(b).
 
 The Sapling value balance is the selected notes less the change, and the Ironwood value
@@ -1334,30 +1420,27 @@ outputs, and HTLC spends and refunds stay Sapling (§39.5, and R39.6.5i for the 
 reason), and the type that carries a swap path's outputs shall not be able to express
 an Ironwood recipient.
 
-R39.6.5e **The Ironwood anchor.** The bundle's anchor shall be a real Ironwood
-note-commitment-tree root: the root at the same anchor height the Sapling anchor is
-taken from, read from the backend's tree state at that height (`GetTreeState`, member
-`ironwoodTree`).
+R39.6.5e **The Ironwood anchor.** The bundle spends no Ironwood note, so its anchor
+shall be the root of the empty Ironwood note-commitment tree, as the dictated chain's
+own wallets set it for a bundle that only pays into Ironwood. No tree state is read for
+it, and no other transaction reads one either. The dictated chain accepts the empty-tree
+root at any height, so the anchor cannot go stale.
 
-- A 32-byte value is the root itself.
-- A longer value is the legacy commitment-tree serialization, and the root is computed
-  from it.
-- A value that is empty, all zero, not decodable, or not a valid anchor shall refuse the
-  build with an error naming the coin and the backend that served the tree state.
-
-The build shall never fall back to the empty-tree root or to any other value. This costs
-one tree-state read per Pirate1 withdrawal and none for any other transaction. Because
-only the root is used, the root-for-state hazard that R39.8.0ak guards against for the
-Sapling checkpoint does no harm here: a bare root in `ironwoodTree` is a usable answer.
-
-> **Provenance (2026-11-04).** Reloaded-original, decided by the maintainer. The
-> dictated chain checks the Ironwood anchor of every transaction that carries an
-> Ironwood bundle and rejects an unknown one, and it accepts the empty-tree root at any
-> height (the published node source, `src/coins.cpp` and `src/txdb.cpp` of release
-> 6.0.14). The empty root was rejected all the same: it would show on chain that no
-> Ironwood note was spent, which marks every such withdrawal as built by a Sapling-only
-> wallet. The value amount moving into Ironwood is public in any case, through the
-> Ironwood value balance, as it is for the chain's own wallets.
+> **Provenance (2026-11-05).** Reloaded-original, decided by the maintainer on
+> 2026-11-05, reversing the real-root choice of 2026-11-04. The dictated chain checks the
+> Ironwood anchor of every transaction that carries an Ironwood bundle and accepts the
+> empty-tree root at any height (the published node source, `src/coins.cpp` and
+> `src/txdb.cpp` of release 6.0.14). The earlier choice held that the empty root would
+> mark a withdrawal as built by a Sapling-only wallet. A survey of 30 recent mainnet
+> transactions with Ironwood actions (heights 4193123--4194266), read with this
+> project's own reader, showed the opposite. All 15 bundles with spends disabled pay into
+> Ironwood and anchor at the empty root; all 15 with spends enabled anchor at a real
+> root. Of the 15 transactions that spend Sapling notes, 10 are of the first kind. A
+> mainnet payment from Sapling into Ironwood made by the chain's own wallet (the fixture of
+> T39.6.5a, height 4198585) has exactly this form. The output-only bundle with the empty
+> root is therefore the common form of a payment into Ironwood, and the bundle this
+> rule builds matches it. The value moving into Ironwood is public in any case, through
+> the Ironwood value balance, as it is for the chain's own wallets.
 
 R39.6.5f **The fee.** A transaction that carries an Ironwood output shall pay a fixed
 10,000 base units (0.0001 ARRR), whatever the coin's `txfee`. This is the fixed fee the
@@ -1384,6 +1467,13 @@ values the bytes do not carry.
 > until its block is scanned, so a send made in that window is rejected by the network
 > as a duplicate nullifier. In the same window the history has no row for it and the
 > change is not shown as pending.
+>
+> **Dependency (2026-11-05).** The recording relies on this project's patched copy of the
+> wallet-database crate (`vendor-patches/zcash_client_sqlite-0.22.0`). Built without
+> Orchard support, as this project builds it, the published crate stops the process when
+> it records a sent transaction that carries an Ironwood bundle, at the step that marks
+> the bundle's spent notes; a wallet built that way holds no Ironwood notes, so no such
+> spend can be its own. The patch skips that step and changes nothing else.
 
 R39.6.5h **The Ironwood proving key.** The proving key for Ironwood actions shall be
 derived in the process from the circuit, on the first build that needs it, and kept for
@@ -1423,17 +1513,17 @@ T39.5A.a requires, that the reference contract of §39.5A answers `is_valid: fal
 
 T39.6.5c *The built transaction.* Building a Pirate1 withdrawal against a wallet fixture
 yields: a version-6 transaction; the selected Sapling spends; exactly two Ironwood
-actions; a Sapling change output to the wallet's own address; no transparent part; the
-fee of R39.6.5f; and value balances that sum to that fee. The transaction reads back
+actions, with spends disabled and outputs enabled; a Sapling change output to the
+wallet's own address; no transparent part; the fee of R39.6.5f; and value balances that
+sum to that fee. No tree state is read. The transaction reads back
 through the project's reader, and its Ironwood proof verifies with the project's
 verifying key. With `max: true` the amount sent is the spendable balance less
 10,000 base units. A target height below the Ironwood activation height is refused
 before note selection.
 
-T39.6.5d *The anchor.* A 32-byte `ironwoodTree` value is used as the root. A legacy
-serialization yields the root computed from it. An empty, all-zero or undecodable value
-refuses the build with the coin and the backend named, and no build ever uses the
-empty-tree root.
+T39.6.5d *The anchor.* The Ironwood anchor of a built Pirate1 withdrawal is the
+empty-tree root, and its flags disable spends and enable outputs. The mainnet fixture
+of T39.6.5a that pays from Sapling into Ironwood has the same flags and the same anchor.
 
 T39.6.5e *The broadcast record.* A submitted Pirate1 withdrawal is recorded: its fee is
 derived from the bytes, its notes are excluded from the next selection until its block
@@ -1447,6 +1537,21 @@ change counts as non-spendable balance.
 > between a lab wallet and an Ironwood wallet: a withdrawal to the Ironwood wallet's
 > Pirate1 address, received by that wallet, and the return payment (R39.8.0bb). The
 > time and memory of the first proving-key build are measured in the same run.
+>
+> **Update (2026-11-05).** T39.6.5a is implemented (PR #242): the Ironwood bundles of two
+> mainnet transactions verify with this project's own verifying key for the post-NU6.3
+> circuit -- the proof, the spend-authorization signatures and the binding signature --
+> and a changed proof byte does not. Building that verifying key takes about a minute in a
+> debug test build. R39.6.5a--R39.6.5h are not implemented yet.
+>
+> **Update (2026-11-05).** R39.6.5a--R39.6.5h are implemented (PR #246), with T39.6.5b--
+> T39.6.5e. A built Pirate1 withdrawal reads back through the project's reader, its
+> Ironwood proof verifies with the project's verifying key, its recipient decrypts the
+> output, and its broadcast is recorded like a Sapling withdrawal (R39.6.5g, its
+> dependency note). In a debug test build the first Ironwood build of a process takes
+> about a minute and a half, the proving key included. The live round trip with an
+> Ironwood wallet is still to run. The bundle is output-only with the empty-tree anchor
+> (R39.6.5d, R39.6.5e as amended on 2026-11-05), so no tree state is read.
 >
 > **Compatibility.** The reference answers a Pirate1 address with `is_valid: false` on
 > `validateaddress` and with `InvalidAddress` on its withdrawal route (§39.5A). This
@@ -1862,6 +1967,14 @@ ahead.
 > Not yet proven: an output to the wallet's own key inside such a transaction (T39.8.0i),
 > full-byte readers on a mainnet transaction with Ironwood actions (T39.6.5a), and a live
 > mainnet deposit from an Ironwood wallet.
+>
+> **Update (2026-11-05).** T39.8.0i and T39.6.5a are implemented (PR #242). An output to
+> the wallet's key in a transaction that carries two real Ironwood actions in field 6
+> scans to the note, the Sapling tree and the balance, is spent by a following build, and
+> counts as pending from the mempool. Two mainnet transactions with Ironwood actions, one
+> paying from Sapling into Ironwood and one from Ironwood into Sapling, are read by every
+> full-byte reader. The broadcast record reads both; for one that spends Sapling notes it
+> cannot yet derive the fee, which R39.6.5g closes. Only the live mainnet deposit remains.
 
 R39.8.0p Generated shielded transactions shall coordinate with the scanner so the
 same wallet note is not selected concurrently by multiple sends or swaps. After
@@ -3975,7 +4088,6 @@ definition -- and are fixed by that specification, not by this project.
 | Chain tip / current block height | `GetLatestBlock` | the admitted endpoints are tried in turn (R39.11.3); the read fails only when every admitted endpoint fails |
 | Compact blocks carrying shielded note data | `GetBlockRange` | as above |
 | Commitment-tree state used as the wallet's sync anchor | `GetTreeState` | as above; the tree bytes are validated per R39.8.0ak before use |
-| Ironwood anchor of a withdrawal to a Pirate1 address (from v0.4.0) | `GetTreeState` at the Sapling anchor height, member `ironwoodTree` | as above; only the root is used, and an unusable value refuses the build (R39.6.5e) |
 | Mempool membership of a shielded transaction, and pending shielded receipts | `GetMempoolTx` | the pending amount degrades to zero (R39.8.0ai) |
 | Block timestamp at a height (resolving a `{"date": T}` sync start) | `GetBlock` | read from the compact block's block-time field (R39.11.4f) |
 | Median time past over a window | `GetBlock` per height in the window | computed locally from the same field (R39.11.4f) |
@@ -6878,3 +6990,27 @@ entries in its list cannot be told apart. Passing the position to the fallback c
     §39.5A (Spec Reader, passed by the Dirty Gate on 2026-11-04). The compatibility note
     of §39.6.5 and the parity record added to T39.6.5b cite that section and add no
     reference fact of their own.
+- *Clean-context addition (2026-11-04), §39.6.4:* R39.6.4f with its provenance and
+  compatibility notes, T39.6.4f, and the sentence added to the §39.6.4 scope bullet in
+  §39.0 are Reloaded-original.
+  - *Inputs:* the maintainer's decisions of 2026-11-04 (the capability word, its
+    requirement with the switch on by default, Reloaded 0.3.0-beta.1 declined, no
+    order-book flag); Chapter 59 §59.4A; and this repository's own code (the acceptance
+    check that the swap freeze already uses, and the Ironwood activation time and height).
+  - They take no forbidden-class input, so chapter 01 R38 is not engaged and no gate pass
+    is required for them. No rule text cleared by the Dirty Gate is edited.
+  - *Reference answer:* how the reference treats protocol information that carries a word
+    is recorded in R39.5.14 (Spec Reader, passed by the Dirty Gate on 2026-11-04). The
+    compatibility note of R39.6.4f cites it and adds no reference fact of its own.
+- *Clean-context addition (2026-11-05), §39.6.5:* the amended Ironwood-bundle bullet of
+  R39.6.5d (output-only, change kept in Sapling), R39.6.5e and its provenance note,
+  T39.6.5c and T39.6.5d, the R39.6.4e(b) parenthetical, the dependency note under
+  R39.6.5g and the update notes under the §39.6.5 and R39.8.0bb status notes are
+  Reloaded-original. The §39.11.1 table row added on 2026-11-04 is removed, because a
+  Pirate1 withdrawal no longer reads a tree state.
+  - *Inputs:* the maintainer's decision of 2026-11-05 (an output-only Ironwood bundle at
+    the empty-tree anchor); a survey of 30 mainnet ARRR transactions with Ironwood
+    actions, fetched from a public lightwalletd endpoint and read with this project's own
+    transaction reader; the published wallet-database crate and this repository's code.
+  - They take no forbidden-class input, so chapter 01 R38 is not engaged and no gate pass
+    is required.
