@@ -117,6 +117,12 @@ A login without `enable_hd` is not affected. Detail: PR #254; CRD ch.05 R45–R4
   that times out. Each decline is logged at debug level with its cause, and at most once an hour a
   warning gives the number declined. Setting `require_v6_counterparty` to `false` in the coin's
   `consensus_params` turns the requirement off. Detail: PR #241; CRD ch.39 R39.6.4f.
+- **An ARRR withdrawal that sets `fee` or `from` is now refused with the shared "unsupported" error.**
+  The answer is `error_type: "UnsupportedError"` (HTTP 400), as for other withdrawals that ask for
+  something a coin cannot do, and as GLEEC KDF answers. A custom `fee` used to give an internal
+  error (HTTP 500). **A `from` used to be ignored silently**, and the withdrawal was made from the
+  wallet's own address; a client that sends `from` for ARRR now gets this refusal instead. Detail:
+  PR #256; CRD ch.49 R49.27a.
 
 #### EVM coins
 
@@ -365,6 +371,24 @@ A login without `enable_hd` is not affected. Detail: PR #254; CRD ch.05 R45–R4
     applies to the version-2 swap's event search.
 
   Detail: PR #248; CRD ch.17 R17.8.1–R17.8.4.
+- **Before refunding on an EVM chain, a taker now finds a late spend of its payment within its time
+  budget.** Before a refund, the taker looks on the chain for a spend of its payment by the maker,
+  under a budget of two minutes. That look always started at the swap's first block. A maker that
+  spent the payment late, near the end of its lock time, left the spend far from the start. On a
+  chain with fast blocks, the look could then run out of time on every try. The taker would keep
+  trying a refund that cannot succeed and never claim the maker's payment.
+  - **Newest blocks first.** The look now scans from the newest blocks down.
+  - **No rescanning.** It remembers what it has scanned for the rest of the session, so a later look
+    goes on where the last one stopped. The newest 12 blocks are always scanned again, in case of
+    a reorganization.
+  - **Lagging nodes.** A node behind the newest block can answer a range as empty. So after a full
+    pass that found nothing, the look starts over. The taker's wait for the spend, and the
+    version-2 swap's event search, go back to their start at most once a minute after an empty
+    pass.
+  - **Version-2 swaps.** The version-2 swap's event search no longer rescans its whole range on every
+    poll.
+
+  Detail: PR #255; CRD ch.17 R17.8.3a.
 
 #### Node names in logs and errors
 
@@ -453,6 +477,10 @@ file carries the detail. "New" means the plan was created in this cycle.
 - [`crate-versioning`](docs/plans/crate-versioning.md) — new, planning: the start-up banner now shows
   the version of the release package (PR #210); where that version should live, and whether the
   `version` call and swap records should carry it, are listed as open questions for the next round.
+- [`electrum-tls-server-authentication`](docs/plans/electrum-tls-server-authentication.md) — new,
+  planning: what an `SSL` Electrum server must present, with and without `disable_cert_verification`,
+  is now written down. So are a warning at activation when the flag is set and an optional pin on the
+  server's key, `spki_sha256`; both are planned and not built yet (PR #240).
 - [`evm-swap-gas-multiplier`](docs/plans/evm-swap-gas-multiplier.md) — blocked: the activation log
   now names the gas limits each EVM coin and token will use and where they come from (PR #200);
   open point 3 is decided, and the fee to send an EVM taker fee is now quoted at the gas limit it
