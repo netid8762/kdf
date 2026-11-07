@@ -1168,7 +1168,11 @@ requester MUST ask one other relay once:
    on a task of its own. Under trigger (a) the own request's record of
    R-Q5b lasts until that request ends the same way it would end for a
    request to F, so the requests parked behind it wait for its answer, each
-   still within its own bound.
+   still within its own bound. The request has the 10 s timeout of R-Q6
+   under either trigger, not the bound of R-Q5b. An answer that arrives
+   after a parked request's bound no longer reaches that request, which was
+   answered at its bound. It is applied as any answer is, and serves this
+   node and the requests that come later.
 7. **Switch.** The top-level `MM2.json` boolean `sync_request_alternate_relay`,
    default `true`; only a JSON `false` turns the rule off, and then the
    requester behaves as R-Q5c and R-Q6 describe. The switch is independent
@@ -1213,6 +1217,69 @@ Reloaded asks the same peer once more after a quick failure (R-Q5c), and one
 other relay once after a failure, timeout included, or after an answer that
 leaves a pair diverged (R-Q5d); a timed-out request is never sent to the same
 peer again.
+
+**R-Q6b (an answer is never related to any root; a newer keep-alive is a
+second, independent exchange).** *(Spec Reader 2026-11-07, rows
+`v2.6.0-beta` and `v3.0.0-beta` of chapter 02 §2.15A, identical at both;
+**passed the KDF Dirty Gate on 2026-11-07**, measure 0.03.)* At both rows:
+
+1. **No comparison, no re-request.** When the answer to a keep-alive-driven
+   request arrives, the requester applies it (R-GH4) and does nothing else:
+   it compares the state it reaches neither with the root of the keep-alive
+   that triggered the request nor with the root of any newer keep-alive that
+   arrived meanwhile, and it never sends a second request on account of an
+   answer. The only trigger of a request is the comparison of R-Q4 at the
+   moment a keep-alive is handled.
+2. **Each keep-alive copy is its own exchange.** Every delivered keep-alive
+   is handled on a task of its own (§32.9A R-B1 row 8). A newer keep-alive
+   from P that arrives while a request for an earlier one is in flight is
+   compared against the root held **at that moment** -- still the old root,
+   because the earlier answer has not been applied yet -- so it produces its
+   own request to its own forwarding peer, naming its own advertised root,
+   whenever that root differs from the held one. The two answers are then
+   applied in the order they arrive, each as R-GH4 says; nothing links them,
+   and whichever is applied last decides the held set (R-Q6's "no
+   de-duplication"). With the held-root option of R-Q4a the second request
+   names the same held root as the first, since the first answer has not
+   landed; the responder treats each on its own (R-Q6a).
+3. **Two timeout layers.** A request can end without an answer in two ways,
+   and the requester treats both as the failure of R-F3b item 4: the
+   transport's own request timeout, 10 s from sending, which surfaces as an
+   **error answer**; and the requester's pending-request sweep, which drops a
+   request older than 10 s at its next tick (every 3 s), so between 10 and
+   13 s after sending, which surfaces as a **dropped request** (the "no
+   answer" of R-Q6a item 5). Whichever fires first ends the exchange; a late
+   answer to a request already dropped is discarded with a logged notice and
+   is not applied.
+4. **What a failed request withholds.** On a relay, the application-level
+   forward of R-F3b for that keep-alive copy does not happen (the
+   gossip-layer forward of R-F3a already has); on any node the held root for
+   the pair stays as it was (R-GH4 item 4). The failure is logged as an
+   error and reported to the message handler as such; it has no other
+   effect, and the next keep-alive from P is handled afresh.
+
+> **Why this matters for Reloaded (informative; this repository, not
+> corpus-sourced).** Reloaded's R-Q5d trigger (b) compares the reached root
+> with the root the **triggering** keep-alive advertised; by item 2 a newer
+> keep-alive has by then started an exchange of its own, so a mismatch
+> against the older root is expected whenever the maker changed state between
+> the two keep-alives, and the alternate-relay request that follows is
+> redundant with the newer exchange rather than wrong. The reference has no
+> comparison at all, so the question does not arise there. Any Reloaded rule
+> that compares roots should compare against the **latest** root advertised
+> for the pair, or against none; whether to change R-Q5d is a maintainer
+> decision (§32.10 D12).
+
+**T-Q6b** *Concurrent keep-alives and the answer (R-Q6b).*
+*(Reloaded-original; passed the KDF Dirty Gate with R-Q6b on 2026-11-07.)* Two
+keep-alives for P and pair X with different roots, delivered 100 ms apart
+from peers F and G while neither answer has arrived, produce exactly two
+requests, one to F and one to G, both naming the root held before either
+answer; applying G's answer after F's leaves G's state held; an answer that
+leaves the held root different from either advertised root causes no third
+request under the reference contract (the test states which contract --
+reference or R-Q5d -- it asserts); a request answered 11 s after sending is
+reported as failed and its late answer is not applied.
 
 **T-Q4** *Request content and target (R-Q4).* A keep-alive for P with a
 single pair entry whose root differs from the held one, delivered as if
@@ -3030,6 +3097,63 @@ the entry under R-GH1 until the next keep-alive for the pair triggers a
 request to a peer whose view is correct — or indefinitely, if every peer it
 asks shares its stale view.
 
+**R-GH8a (Reloaded: the previous orders are replaced only after the new
+order passes its checks).** *Reloaded-original (2026-11-07, the maintainer's
+Decisions DB and DG); no forbidden-class input. It rests on R-GH8 and R-GH9,
+which passed the KDF Dirty Gate, and on this repository's own re-pricing
+path.* An opt-in. With `setprice_replace_after_checks` on, `setprice` with
+`cancel_previous`:
+1. *Checks first.* Runs every check of the new order before it touches the
+   previous orders: every check that cancels the previous orders on error
+   under R-GH8 (the balance and volume checks, for `max` the maximum volume,
+   and, in a build with IBC routing for swaps, its minimum-balance check) and
+   the build of the order itself (its volume, minimum volume and price).
+2. *Then the replacement.* Only when all of them pass does it replace the
+   previous orders of the directed pair as R-GH8 and R-GH9 say: the same
+   orders, the same local removal from the maker's own set, read index and
+   trie, and one cancel per replaced order. R-GH9's order holds, except that
+   the new order is built before the first cancel; it is saved, inserted
+   locally and published only after the last cancel.
+3. *A failed check leaves the pair as it was.* When any check fails, the
+   request returns that check's error and the previous orders stay: no cancel
+   message is published, and neither the maker's set nor the advertised root
+   changes. The previous orders keep their price: after a failed re-pricing
+   they stay live and matchable at the old price until the next successful
+   re-pricing or a cancel; the balance watch named in the rationale below
+   corrects their volume, not their price. A maker that prefers an empty pair
+   to a stale price leaves the switch off, its default.
+4. *Unchanged either way.* The refusals that come before the balance checks
+   and already leave the previous orders alone (an unknown, untradable or
+   wallet-only coin, a swap-key mismatch, the pre-trade spend check of
+   [Chapter 60](60-trading-floors-and-refusal-contract.md) R60.6.7 item 3) are not
+   affected, and neither is `setprice` without `cancel_previous`.
+5. *Switch.* `setprice_replace_after_checks` is a top-level boolean, `false`
+   by default; only a JSON `true` turns it on. With `false`, R-GH8 holds as
+   written: a failed balance check cancels the previous orders, and a build
+   that fails after the cancel leaves the pair without an order.
+6. *Wire.* Nothing on the wire changes, and no message is added. A peer sees
+   either the previous orders unchanged or the replacement, never a pair
+   emptied by a failed re-pricing.
+
+*Rationale.* On 2026-10-30 a fee estimate that lagged the chain's base fee
+failed the balance check of an EVM re-pricing in the field. The maker's
+orders on the pair were cancelled and nothing replaced them until the next
+round. Decision AZ made that trigger rarer, but any other transient failure
+of the checks, such as a node error or a balance read that times out, still
+emptied the pair. A previous order that is no longer fundable does not stand
+for long either way: the balance watch of [Chapter 60](60-trading-floors-and-refusal-contract.md)
+R60.4.5 re-reads the base coin of every pair with maker orders every 30 s and
+corrects or cancels such orders.
+
+*Default side (Decision DG).* The default is the reference behavior, by arm 1
+of `docs/COMPAT_SWITCHES.md`, "The default-side rule": the switch changes what
+other nodes can match. With it on, a maker whose re-pricing failed stays
+matchable at its previous price until it re-prices successfully or cancels
+(item 3). An empty pair costs only trades; a stale price can cost funds. A
+maker that prefers keeping its orders through a failed check turns the switch
+on. (Decision DG of 2026-11-07 supersedes Decision DE, which had chosen the
+opposite default without weighing the stale price.)
+
 **R-GH10 (Reloaded today).** *Established 2026-11-01 against this
 repository's own keep-alive receiver, synchronization applier, order-
 message handlers, eviction sweep, keep-alive producer and re-pricing path;
@@ -3058,7 +3182,10 @@ liveness on the receiver's clock, switch `pair_liveness`, default on.)*
 *(Since 2026-11-05, §32.7.3 R-Q5b item 6 parks a request that reaches a
 relay before the placeholder exists, and R-GH12a lets the order-book answer
 wait briefly for a lagging worker. Both change only the timing of an answer
-that would otherwise fail.)*
+that would otherwise fail.)* *(Since 2026-11-07, R-GH8a: with
+`setprice_replace_after_checks` on, an opt-in, a re-pricing whose checks
+fail leaves the previous orders as they were; at the default R-GH8 holds as
+written.)*
 
 **T-GH1** *Unnamed pairs are untouched (R-GH1).* A node holding entries of
 P on pairs X and Y receives a keep-alive from P naming only X with X's held
@@ -3110,8 +3237,23 @@ worker is idle, the pair's held root covers the two new orders and neither
 old one; the keep-alive of the next tick advertises that root; with the
 worker held back across a tick, Reloaded skips or delays the advertisement
 (R-T3b item 2) rather than advertising a root covering an old order. Orders
-of (rel, base) are untouched; a failed balance check still cancels the old
-orders and creates none.
+of (rel, base) are untouched. With `setprice_replace_after_checks` at its
+default (`false`), a failed balance check still cancels the old orders and
+creates none; with it on, see T-GH8a.
+
+**T-GH8a** *Replace only after the checks (R-GH8a).* A maker with two orders
+on (base, rel), `setprice_replace_after_checks: true`:
+- a re-pricing with `cancel_previous` whose balance check fails once (a coin
+  that answers the check with an error) returns that error; both previous
+  orders are still in the maker's set and in the pair's held root, and no
+  cancel message is published;
+- a re-pricing whose new order the builder refuses (a volume below the
+  order's minimum) behaves the same;
+- the next re-pricing whose checks pass replaces both orders as T-GH8 and
+  T-GH9 say;
+- with the switch absent or `false`, the first case cancels both previous
+  orders and creates none (R-GH8);
+- a value that is not a boolean is taken as the default (`false`).
 
 **T-GH9** *One cancel per replaced order, in order (R-GH9).* The same
 re-pricing publishes exactly two cancel messages, one per old order
@@ -3128,7 +3270,9 @@ value and `order_messages_refresh_liveness` at either value, and with
 `order_messages_refresh_liveness` at its default, T-GH3's silence is
 counted from the last keep-alive **or order message** of P. T-GH5's
 "inserted after" holds with `cancel_final_window_secs: 120`; at the
-default the late duplicate is dropped for the window (T-K8).
+default the late duplicate is dropped for the window (T-K8). T-GH8's
+failed-check case holds at the default; with
+`setprice_replace_after_checks: true`, T-GH8a applies.
 
 ### 32.9C.1 Follow-up: resurrection paths, the order-book answer, and the maker's ticks
 
@@ -4536,3 +4680,43 @@ V5. **Relay forward ordering at the baseline.** Confirm against the
   parked-request table and order-book answer. The reference facts it rests on
   are R-F3a, R-GH12 and the "no data" and "missing pair" classes of R-Q5a,
   which passed the KDF Dirty Gate. It needs no Dirty Gate pass of its own.
+- *Scoped addition (2026-11-07) -- R-Q6b, T-Q6b and the informative note
+  under R-Q6b.* **KDF Dirty Gate: PASS on 2026-11-07, measure 0.03.** *Inputs:* the forbidden corpus at the rows
+  `v2.6.0-beta` and `v3.0.0-beta` of chapter 02 §2.15A, identical at both,
+  consulted **only** to establish how a requester relates a synchronization
+  answer to the keep-alive that caused it and to a newer keep-alive that
+  arrived meanwhile (no comparison, no re-request, independent handling of
+  each copy), the two timeout layers of the request and what each yields,
+  and what a failed request withholds. Behavior only; no private identifier,
+  function body, helper decomposition, error, log or comment text was
+  reproduced. The informative note rests on this chapter's own R-Q5d; T-Q6b
+  is Reloaded-original.
+  *Dirty Gate clearance (chapter 01 T1, R40).* PASS on 2026-11-07, measure
+  0.03, no findings. *Extent:* order-book keep-alive handling, synchronization
+  request and answer handling, the request timeout and the pending-request
+  sweep, and relay forwarding on handler failure, at `v3.0.0-beta` with
+  `v2.6.0-beta` as cross-check; for the whole batch, about 24 source files
+  were read in full or in the relevant regions at the `dev (as of 2026-03-27)`
+  row, whose source tree is identical to `v3.0.0-beta`, and the same modules
+  were diffed against `v2.6.0-beta`. *Method:* reading, with mechanical
+  cross-checks (diffs between the tabled states; pattern searches of the added
+  lines for paths, identifiers and markers); the gate script was not run
+  because the candidate has no code blocks. *Measure:* 0.03, read against the
+  standard that any discretionary finding fails a chapter; dictated-interop
+  and public-surface tokens were excluded from the measured set.
+- *Reloaded-original addition (2026-11-07): R-GH8a and T-GH8a, and the notes
+  that point to them.* The notes are those on R-GH10, T-GH8 and T-GH10.
+  Written by a context that never read the forbidden corpus. Its sources are
+  the maintainer's Decisions DB and DG of 2026-11-07 (DG superseding DE), a
+  field report of 2026-10-30, a second-session review that raised the
+  stale-price cost, and this repository's own re-pricing path and balance
+  watch. The reference facts it rests on are R-GH8 and R-GH9, which passed the
+  KDF Dirty Gate. It needs no Dirty Gate pass of its own.
+- *Reloaded-original addition (2026-11-07, Decision DA) -- the last three
+  sentences of R-Q5d item 6.* They state the timeout the request to another
+  relay already has, and what an answer after a parked request's bound still
+  serves. Written by a context that never read the forbidden corpus. Its
+  sources are the maintainer's Decision DA, this repository's own keep-alive
+  requester and parked-request table, and a lab run of this project's own
+  nodes with reference binaries as black boxes, reported as counts. It states
+  no reference fact and needs no Dirty Gate pass.
