@@ -287,6 +287,19 @@ A login without `enable_hd` is not affected. Detail: PR #254; CRD ch.05 R45–R4
 
 #### UTXO coins and Electrum
 
+- **`fetch_utxos`, `consolidate_utxos` and the automatic merge (`utxo_merge_params`) now work
+  under an HD login**, as they do in GLEEC KDF. Until now the two commands were refused and the
+  automatic merge stayed off.
+  - `fetch_utxos` lists the unspent outputs of every address the wallet knows, in every account. It
+    makes no new address known.
+  - `consolidate_utxos` merges only the outputs of the coin's own address, the one at
+    `path_to_address`, into one output paid back to it. No other address is touched. With
+    `broadcast: false` it returns the transaction without sending it.
+  - The automatic merge works on the same address, for a UTXO coin such as RIN and for QTUM.
+  - Under a Trezor key, `consolidate_utxos` answers `InvalidAddress` and the automatic merge stops,
+    so the device is never asked to sign; `fetch_utxos` works.
+
+  Detail: PR #281; CRD ch.05 R35b.
 - **Electrum reads now go only to the servers with the shortest round trip.** Since 0.3.0-beta.1
   a coin's read-only Electrum queries took turns over every connected server, so a distant server
   in the list answered one read in N. Now they take turns only among the connected servers whose
@@ -514,6 +527,11 @@ A login without `enable_hd` is not affected. Detail: PR #254; CRD ch.05 R45–R4
   node records these addresses when it builds the transaction, in the same file as a withdrawal's
   recipient, and fetches nothing. Detail: PR #277; CRD ch.39 R39.8.9d3.
 
+- **The ARRR history now reports the fee of the wallet's own sends.** A withdrawal, a swap payment
+  and a swap fee payment show the fee they paid in `transaction_fee`, before and after mining. Every
+  row used to report 0. The fee comes from the record the node writes when the backend accepts the
+  broadcast. Found in a live test. Detail: PR #288; CRD ch.39 R39.8.9e1.
+
 #### EVM coins
 
 - **A taker on an EVM chain with fast blocks, such as Monad, now finds the maker's spend of its
@@ -587,6 +605,12 @@ A login without `enable_hd` is not affected. Detail: PR #254; CRD ch.05 R45–R4
 
 #### Siacoin
 
+- **An unreadable transaction in a Sia node's transaction pool no longer breaks the lookups that read the
+  pool.** The pool reply is now read one transaction at a time and a transaction the library cannot read
+  is left out, so the fee validation of a swap, the raw-transaction lookup and the wait for a spend no
+  longer fail because of it. Before, one such transaction made the whole reply fail. A left-out
+  transaction is logged only at debug level by the Sia library. Detail: PR #291; CRD ch.20 R-N4.
+
 - **A wallet without SC can now receive SC in a swap.** The swap refused to start with "Not enough SC
   for swap: available 0, required at least 0.00001", although the receiving side spends no wallet
   funds. The miner fee of the spend is taken from the payment itself, and the node now reports it that
@@ -634,6 +658,34 @@ A login without `enable_hd` is not affected. Detail: PR #254; CRD ch.05 R45–R4
   This covers a coin's dynamic fee and an explicit `UtxoFixed` or `UtxoPerKbyte` withdraw fee.
   Detail: PR #247; CRD ch.38 R38.6.6b, T38.6.6b.1.
 
+#### Price service and the maker bot
+
+- **The price service that no longer exists is replaced, prices now come from two sources that check each
+  other, and swaps record their USD prices again.** The address `prices.komodo.live`, which the
+  market-maker bot used for its default prices and which the node asks when a swap ends for the USD prices
+  it stores with the swap, no longer resolves. Since then the bot could not fetch prices unless you named
+  another service, and no swap completed stored USD prices. The default is now two sources asked at the
+  same time: the GLEEC price service (and, if it does not answer, its cache) and the cipig price service,
+  each with `?expire_at=259200` so that no price older than 72 hours is served. A coin that only one source
+  prices is priced from it. A coin both price must agree within 5 %; if they do not, the coin gets no
+  price from either, and the bot quotes no pair with it. A source that does not answer is skipped. The bot
+  and the swap prices use the same sources. Two new top-level keys in `MM2.json` change them: `price_urls`
+  (an array of sources, each one address or an array of addresses tried in order) replaces the default
+  sources, and `price_providers` (an array of names) replaces the price providers the node recognizes
+  (`binance`, `coingecko`, `coinpaprika`, `forex` and `livecoinwatch`); a wrong provider list stops
+  pricing of the coins it leaves out. The `start_simple_market_maker_bot` request accepts `price_urls`
+  beside `price_url`; a request with both, or with a malformed value, is refused. A price service that
+  fails is now reported once when it starts failing and once when it answers again, not every 30 seconds,
+  and so is the bot finding no source at all; on a native build each attempt takes at most 10 seconds (a
+  browser build also sets a timer, which no test covers yet); and log lines name a service by its host only,
+  with the text of an error, such as the body of a server's answer, cleaned of the address that was
+  asked. A swap you took part in is priced once, when it has ended successfully; a swap that failed gets no prices. Prices from
+  livecoinwatch are now accepted, so the bot can quote coins such as RIN that only that provider prices,
+  and the bot no longer divides by a price of zero. A bot pair whose price is refused or lost still has its
+  order cancelled at once, as in GLEEC KDF; this behavior is under observation in v0.4.0 and will be
+  revisited. See [Network configuration](docs/NETWORK_CONFIG.md#price-service).
+  Detail: PR #287; CRD ch.62.
+
 ### Tests
 
 - **The Qtum testnet tests now use the one public Qtum testnet server, and the QRC20 docker test
@@ -644,6 +696,13 @@ A login without `enable_hd` is not affected. Detail: PR #254; CRD ch.05 R45–R4
   a new contract shows its code before the first call to it, and the waits are longer but still
   bounded. The node itself is unchanged.
   Detail: PR #283.
+- **The tests that need public servers are off unless you ask for them, and two stale ones are
+  fixed.** About 190 unit and integration tests connect to public servers, and a plain `cargo test`
+  failed on them whenever a server was down or had changed. They are now ignored by default. Build
+  with the `live-network-tests` feature to run them; CI runs the same tests as before. The two tests
+  that read one DOC and one MARTY transaction from the live chains use transactions that exist
+  today. The Firo test that expected a fee the server no longer sends is ignored, and an offline test
+  checks that fee path instead. The node itself is unchanged. Detail: PR #285.
 - **The tests run before the next beta are listed in
   [`docs/release-tests/0.4.0-beta.1.md`](docs/release-tests/0.4.0-beta.1.md).** The lab rows of
   the cycle's second batch are recorded there now; the release campaign follows.
@@ -699,6 +758,8 @@ file carries the detail. "New" means the plan was created in this cycle.
   written (CRD PR #227), and its generic part, the word's writer and fail-closed reader and the
   decline log lines, is implemented (PR #235); the ARRR rule that uses it is written (CRD PR #230)
   and implemented (PR #241).
+  The shielded history gained two items: the addresses of a swap's own transactions (PR #277) and
+  the fee of an own send (PR #288).
 - [`crate-versioning`](docs/plans/crate-versioning.md) — new, planning: the start-up banner now shows
   the version of the release package (PR #210); where that version should live, and whether the
   `version` call and swap records should carry it, are listed as open questions for the next round.
@@ -736,7 +797,8 @@ file carries the detail. "New" means the plan was created in this cycle.
   `from` under an iguana login are done (items H5.1 and H5.5, PR #270); the maintainer set the
   default sender to the coin's activated address (decision CU). Activation lists the address at
   `path_to_address`, and `task::create_new_account` works without a hardware wallet (items H5.0 and
-  H5.4, PR #279).
+  H5.4, PR #279). `fetch_utxos`, `consolidate_utxos` and the automatic merge work under an HD login
+  (item H5.3, PR #281).
 - [`maker-gossip-rate-control`](docs/plans/maker-gossip-rate-control.md) — still parked: the
   queue-signal flaw found in the field is fixed (PRs #204, #214); the other default-on items
   remain.
@@ -849,6 +911,10 @@ lives.
   fetches nothing more. Swap rows from before this release keep the sets they had. More in
   [`arrr-native-and-ironwood-pool`](docs/plans/arrr-native-and-ironwood-pool.md). Detail: PRs #268,
   #277; CRD ch.39 R39.8.9d2 (d), R39.8.9d3 (d).
+- **The ARRR history reports a fee of 0 where the node does not know the fee.** That is the case
+  for a transaction another wallet built, such as a deposit, for a swap's spend or refund, and for
+  an own send that a rebuilt wallet database found by scanning. The node reads compact blocks,
+  which carry no fee data, and fetches nothing more. Detail: PR #288; CRD ch.39 R39.8.9e1 (b), (c).
 - **An ARRR withdrawal takes no memo, and its answer has no `memo` member.** The `withdraw`
   request has no `memo` field, so a memo sent with it is ignored and the shielded output carries
   none. Komodo DeFi Framework and GLEEC KDF echo the request's memo in the answer. Memo support is
