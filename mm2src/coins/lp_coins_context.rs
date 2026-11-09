@@ -94,6 +94,35 @@ impl Deref for MmCoinEnum {
     }
 }
 impl MmCoinEnum {
+    /// Whether the coin's keys are held by a hardware wallet (the Trezor key policy). The host never exports the
+    /// private key of such a coin.
+    pub fn uses_trezor_policy(&self) -> bool {
+        match self {
+            MmCoinEnum::UtxoCoin(ref c) => matches!(c.as_ref().priv_key_policy, PrivKeyPolicy::Trezor),
+            MmCoinEnum::QtumCoin(ref c) => matches!(c.as_ref().priv_key_policy, PrivKeyPolicy::Trezor),
+            MmCoinEnum::Qrc20Coin(ref c) => matches!(c.as_ref().priv_key_policy, PrivKeyPolicy::Trezor),
+            MmCoinEnum::Bch(ref c) => matches!(c.as_ref().priv_key_policy, PrivKeyPolicy::Trezor),
+            MmCoinEnum::SlpToken(ref c) => matches!(c.as_ref().priv_key_policy, PrivKeyPolicy::Trezor),
+            MmCoinEnum::EthCoin(ref c) => c.uses_hardware_signer(),
+            _ => false,
+        }
+    }
+
+    /// The hardware context a coin of the Trezor key policy was activated with: its device digest is the identity
+    /// the coin keeps for the lifetime of its activation (CRD ch.05 R58a). `None` for a coin that holds no such
+    /// record, which every coin of another policy does.
+    pub(crate) fn activation_hardware_context(&self) -> Option<crypto::HardwareWalletArc> {
+        match self {
+            MmCoinEnum::UtxoCoin(ref c) => c.as_ref().hw_ctx.clone(),
+            MmCoinEnum::QtumCoin(ref c) => c.as_ref().hw_ctx.clone(),
+            MmCoinEnum::Qrc20Coin(ref c) => c.as_ref().hw_ctx.clone(),
+            MmCoinEnum::Bch(ref c) => c.as_ref().hw_ctx.clone(),
+            MmCoinEnum::SlpToken(ref c) => c.as_ref().hw_ctx.clone(),
+            MmCoinEnum::EthCoin(ref c) => c.activation_hardware_context(),
+            _ => None,
+        }
+    }
+
     pub fn is_utxo_in_native_mode(&self) -> bool {
         match self {
             MmCoinEnum::UtxoCoin(ref c) => c.as_ref().rpc_client.is_native(),

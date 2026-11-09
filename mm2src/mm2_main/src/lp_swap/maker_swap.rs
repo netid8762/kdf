@@ -1,6 +1,7 @@
 use super::check_balance::{check_base_coin_balance_for_swap, check_my_coin_balance_for_swap, CheckBalanceError,
                            CheckBalanceResult};
 use super::pubkey_banning::ban_pubkey_on_failed_swap;
+use super::stale_tip_watch::{sleep_observing_tip, StaleTipWatch};
 use super::swap_lock::{SwapLock, SwapLockOps};
 use super::trade_preimage::{TradePreimageRequest, TradePreimageRpcError, TradePreimageRpcResult};
 use super::{already_sent_check_pubkey, check_held_htlc_key, derive_htlc_pubkeys, recover_within, recovery_key_pairs,
@@ -14,7 +15,8 @@ use super::{broadcast_my_swap_status, broadcast_swap_message_every, check_other_
             TransactionIdentifier, WAIT_CONFIRM_INTERVAL};
 use crate::mm2::lp_dispatcher::{DispatcherContext, LpEvents};
 use crate::mm2::lp_network::subscribe_to_topic;
-use crate::mm2::lp_ordermatch::{check_pre_trade_spend_safety, swap_key_mismatch, untradable_coin_ticker,
+use crate::mm2::lp_ordermatch::{check_pre_trade_spend_safety, raised_default_for_check,
+                                raised_default_min_volume_term, swap_key_mismatch, untradable_coin_ticker,
                                 MakerOrderBuilder, OrderConfirmationsSettings};
 use crate::mm2::lp_swap::{broadcast_p2p_tx_msg, retried_refund_rejection, tx_helper_topic, NON_FINAL_REFUND_RETRY_SECS};
 use crate::mm2::MM_VERSION;
@@ -867,13 +869,14 @@ impl MakerSwap {
         } else {
             let transaction_f = self
                 .maker_coin
-                .check_if_my_payment_sent(
+                .check_if_my_payment_sent_for_amount(
                     self.r().data.maker_payment_lock as u32,
                     &*self.r().my_maker_coin_htlc_pub,
                     &*self.r().other_maker_coin_htlc_pub,
                     &secret_hash,
                     self.r().data.maker_coin_start_block,
                     &self.r().data.maker_coin_swap_contract_address,
+                    &self.maker_amount,
                 )
                 .compat();
             transaction_f.await
@@ -1183,11 +1186,15 @@ impl MakerSwap {
         non_final_retry_secs: f64,
     ) -> Result<(Option<MakerSwapCommand>, Vec<MakerSwapEvent>), String> {
         let locktime = self.r().data.maker_payment_lock;
+        // CRD ch.51 R79-R81: the refund wait reads the tip height of the paying coin between its sleeps.
+        let mut stale_tip_watch = StaleTipWatch::new();
         let transaction = loop {
             loop {
                 match self.maker_coin.can_refund_htlc(locktime).compat().await {
                     Ok(CanRefundHtlc::CanRefundNow) => break,
-                    Ok(CanRefundHtlc::HaveToWait(to_sleep)) => Timer::sleep(to_sleep as f64).await,
+                    Ok(CanRefundHtlc::HaveToWait(to_sleep)) => {
+                        sleep_observing_tip(&self.maker_coin, &self.uuid, to_sleep as f64, &mut stale_tip_watch).await
+                    },
                     Err(e) => {
                         error!("Error {} on can_refund_htlc, retrying in 30 seconds", e);
                         Timer::sleep(30.).await;
@@ -1555,13 +1562,14 @@ impl MakerSwap {
                 );
                 let maybe_maker_payment = try_s!(
                     self.maker_coin
-                        .check_if_my_payment_sent(
+                        .check_if_my_payment_sent_for_amount(
                             maker_payment_lock,
                             search_pub.as_slice(),
                             other_maker_coin_htlc_pub.as_slice(),
                             &secret_hash.0,
                             maker_coin_start_block,
                             &maker_coin_swap_contract_address,
+                            &self.maker_amount,
                         )
                         .compat()
                         .await
@@ -2498,9 +2506,24 @@ pub async fn maker_swap_trade_preimage(
     if let Some(mismatch) = swap_key_mismatch(ctx, &base_coin, &rel_coin) {
         return MmError::err(TradePreimageRpcError::from(mismatch));
     }
+    // CRD ch.60 R60.6.8 item 1: the preview describes a `setprice` without `min_volume`, so it takes the same raised
+    // default as the order would: the same term from the same fee reading, capped at the volume where it is known
+    // (`max` false), and checked at that value; a `max` preview is checked again once its volume is computed.
+    let raised_default_term = raised_default_min_volume_term(ctx, &base_coin, &rel_coin, &req.price)
+        .await
+        .map_to_mm(TradePreimageRpcError::from)?;
+    let min_volume_checked = raised_default_term.as_ref().and_then(|term| {
+        raised_default_for_check(
+            &base_coin,
+            &rel_coin,
+            &req.price,
+            term,
+            (!req.max).then_some(&req.volume),
+        )
+    });
     // CRD ch.60 R60.6.7 item 3: the preview applies the pre-trade spend-safety check of an order with the
     // default minimum volume, as the order the preview describes would carry.
-    check_pre_trade_spend_safety(ctx, &base_coin, &rel_coin, None, &req.price)
+    check_pre_trade_spend_safety(ctx, &base_coin, &rel_coin, min_volume_checked, &req.price)
         .await
         .map_to_mm(TradePreimageRpcError::from)?;
     let base_coin_ticker = base_coin.ticker();
@@ -2522,6 +2545,12 @@ pub async fn maker_swap_trade_preimage(
         }
         req.volume
     };
+    if let (true, Some(term)) = (req.max, raised_default_term.as_ref()) {
+        let capped = raised_default_for_check(&base_coin, &rel_coin, &req.price, term, Some(&volume));
+        check_pre_trade_spend_safety(ctx, &base_coin, &rel_coin, capped, &req.price)
+            .await
+            .map_to_mm(TradePreimageRpcError::from)?;
+    }
 
     let preimage_value = TradePreimageValue::Exact(volume.to_decimal());
     let base_coin_fee = base_coin

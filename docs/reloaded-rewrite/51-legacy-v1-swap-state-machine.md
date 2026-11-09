@@ -801,6 +801,80 @@ payment is spent and the taker payment is not.
 > `cargo test -p mm2_main --lib test_recover_funds` passed, 42 tests of which these five
 > are new, and the formatting check passed.
 
+## 51.6B Bound Warning for a Refund Wait on a Stalled Node
+
+> **Status (Reloaded-original; batch 4, 2026-11-08).** These rules record no
+> claim about the reference implementation. They add a log line only; the
+> events, the resume map (R19, R32) and the persisted log shape of chapter 44
+> are unchanged.
+
+While a maker or taker swap waits to refund its own payment, the wait
+consults the coin only through the refundability check, which answers "wait
+this many seconds" (at most an hour at a time) and never says why the answer
+does not change. When the coin's node stops advancing, the answer stays
+"wait", the swap keeps waiting and the log says nothing that points to the
+node. A wait that outlives a stalled node therefore looks like an ordinary
+wait.
+
+**R79.** *A refund wait observes the coin's tip height, beside the wait.* While a
+swap of this chapter waits for the refund of its own payment, the swap MUST read
+the tip height of the paying coin once every 5 minutes, and MUST NOT read it more
+often (a wait that is cut into shorter steps reads once per 5-minute period, not
+once per step; one second of clock rounding is tolerated). The read runs
+alongside the sleep of the step and is abandoned when that sleep ends, so it is
+never on the path of the wait; a read that fails or does not finish by then is not
+an observation and is skipped. The wait itself (its length, the refund decision,
+the events and the state) MUST NOT change because of the observation.
+
+**R80.** *A tip that does not advance is warned about, at most hourly.* When
+the observed height has not changed for 60 minutes, the swap MUST write one
+warning to the log that names the coin by its ticker, the height and the number
+of whole minutes the height has not changed. While the height stays the same
+the warning MUST NOT be repeated more often than once every 60 minutes. A
+change of height ends the stall, and a later stall counts from the change. The
+warning MUST NOT contain a server address, URL, host or response text; the
+ticker is the only name of the coin's node source. The clock of the stall
+starts at the first observation of the wait; a restart of the node starts it
+again.
+
+**R81.** *What the rule does not cover.* The warning exists for the refund waits
+of the maker and the taker of this chapter. It is not written for the wait for
+the confirmation of a payment, for the swaps of the second protocol version
+or for the watcher. It is not written while the refundability check itself fails (that
+case keeps its existing error line and 30-second retry). It does not name the
+cause (a stopped node, a node that is behind, a chain that has stopped).
+
+> **As built (batch 4, 2026-11-08).** The rule lives in
+> `mm2src/mm2_main/src/lp_swap/stale_tip_watch.rs`: a pure `StaleTipWatch`
+> (`observe(now_secs, height)`, no clock inside) and `sleep_observing_tip`, which
+> cuts the wait into slices of at most 300 s. At the start of a slice, when the
+> height is due, `current_block()` of the paying coin is read alongside the
+> slice's sleep (`sleep_beside_read`: the read raced against the sleep). The slice
+> ends exactly when the sleep ends. A read that finishes first is observed and the
+> sleep is awaited on; a read that fails, or has not finished when the sleep
+> ends, is dropped and skipped, so no read is ever awaited after its sleep and
+> the wait is not lengthened. A read is due only when 300 s (less 1 s of clock
+> rounding) have passed since the previous one, so the short steps of the taker's
+> refund wait read the coin once per 5 minutes, not at every step. The maker's
+> refund wait (`refund_maker_payment_retrying`) uses it in place of its
+> `HaveToWait` sleep; the taker's (`refund_taker_payment_paced`) in place of its
+> step sleep, one watch per refund wait, created before the inner loop. The `Err`
+> arm (30 s retry) is unchanged. Tests: the `t33_*` tests of that module (fake
+> clock, sleeper and reads); two existing taker tests that answer "wait" now mock
+> `current_block`; only the taker's call site runs in a test (through those two
+> tests), the maker's call site is covered by construction. A read is counted as
+> made when it starts, so a maker wait that ends in very short sleeps (a wait of
+> 0 to 2 seconds close to the lock time) whose read takes longer than the sleep
+> has that read dropped and its 5-minute period used up; such a wait may observe
+> rarely, while the taker's steps (5 to 300 seconds by default) and the
+> 300-second slices of the maker's observe as the rule says.
+> Run on 2026-11-08: `cargo test -p mm2_main --lib -- stale_tip_watch` passed (15
+> tests), `-- r31a` passed (10 tests), and the formatting check passed. The warning
+> is verified by these unit tests only: the timing is driven by a fake sleeper
+> and a fake height source, and no real-time observation of it on a stalled
+> node exists. A lab row that observes it on a frozen tip is an optional
+> follow-up, not a condition of this rule.
+
 ## 51.7 Bound Message Contract
 
 **R41.** *Six message kinds, one envelope.* The legacy swap message
@@ -1067,8 +1141,9 @@ itself. A message that does not decode or verify is discarded with a
 warning. A broadcast that the network refuses is the usual outcome, since
 the parties have normally broadcast the transaction already (it is in the
 mempool or in a block), and is logged at debug level only. Which nodes act
-on the topic, and what a reference receiver does with the message, are
-open (D6). *(Pointer added 2026-11-07.)* The reference's publishing side --
+on the topic is open (D6). What a reference receiver does with the message
+was open too; the note below records it (passed the KDF Dirty Gate on
+2026-11-04, PR #232, merged 2026-11-05). *(Pointer added 2026-11-07.)* The reference's publishing side --
 which steps of the maker, the taker, their recovery paths and the watcher
 publish, in which outcomes, for which coin kinds, and with which key -- is
 recorded in [Chapter 09](09-watcher-reward-infrastructure.md) R24, which
@@ -1542,6 +1617,68 @@ carry it.
 > instead of a raw parse failure (`SiaCheckIfMyPaymentSentArgsError::
 > WrongSecretHashLength`, `SiaValidatePaymentInputError::
 > WrongSecretHashLength`) rather than something recovery can act on.
+>
+> **EVM leg: closed in code and verified in the lab as of 2026-11-08.** The
+> "plausible in other coin families" remark above held for the EVM legacy
+> swap contract. That contract takes the hash as a `bytes20` argument and
+> verifies a spend with `ripemd160(sha256(secret))`, which is exactly the
+> second case of R72A. Before this change the EVM coin layer put the shared
+> `secret_hash` into that slot unchanged: with the 32-byte alternate the
+> ABI encoder accepted the value, the counterparty decoded only its leading
+> 20 bytes and refused the payment ("secret_hash arg ... is invalid"), and
+> such a payment could not have been spent. Now the EVM layer derives the
+> slot value with one helper, `contract_secret_hash`
+> (`mm2src/coins/eth/secret_hash_value.rs`): 20 bytes unchanged, 32 bytes
+> `RIPEMD160` applied once, any other width an error with the text of the
+> UTXO comparator. The payment build (`send_hash_time_locked_payment`, ETH
+> and ERC20 arms, `eth_impl.rs`) embeds the derived value and fails before
+> building when the width is wrong; the payment validation
+> (`validate_payment`, both arms) compares the decoded slot with the derived
+> value through `check_payment_secret_hash_arg`, and its error names the
+> derived value as the expected one. The swap id (`etomic_swap_id`) is still
+> computed over the shared value on both sides, unchanged. Spend and refund
+> read the payment's own arguments from the payment transaction, which hold
+> the derived value already, and secret extraction reads the revealed secret
+> from the spend call, so they needed no change (R72B holds: the maker and
+> taker stage graphs pass the shared value unchanged). The 20-byte path is
+> byte-for-byte as before. Tests: `eth_secret_hash_tests.rs`, all prefixed
+> `r72a_` (helper, payment build for ETH and ERC20 against literal vectors,
+> swap id, validation). Run on 2026-11-08: `cargo test -p coins --lib -- eth::`
+> passed (425 tests, the new ones included) and the formatting check passed.
+> Lab (2026-11-08, build of PR #290, Siacoin against USDC-MON on Monad, 32-byte
+> secret hash H32, contract value D20 = RIPEMD-160(H32)): cell A (the maker sells
+> SC) and cell A2 (the maker sells USDC-MON) passed, payment and spend, and cell
+> B, the refund case (maker USDC-MON, taker Siacoin), passed. In cell B the
+> maker's real payment carried D20 left-aligned in the hash slot (payment word 4)
+> and the leading 20 bytes of H32 (the value before the fix) appeared in no
+> word; the maker's refund transaction carried D20 in its payment-hash slot
+> (refund word 2); the maker ended
+> MakerPaymentRefunded and Finished with no "secret_hash arg ... is invalid" line
+> in either log; the taker never sent its Siacoin payment and ended cleanly. The
+> maker's USDC-MON balance was exactly back to its starting amount after the refund (the
+> token is not reduced by gas; gas is paid in MON). A run of the build before
+> the fix, for comparison, was not done.
+>
+> The QRC20 legacy swap uses the same contract and the same `bytes20` slot,
+> and has the same defect and the same fix, with the same helpers
+> (`mm2src/coins/qrc20/swap.rs`). `erc20_payment_call_bytes` derives the slot
+> value (a wrong width is an `InvalidParams` error, so no payment is built);
+> both the payment build and the validation's expected call bytes come from
+> it. `validate_payment` also compares the decoded slot with the derived
+> value through `check_payment_secret_hash_arg`, before the call-bytes
+> comparison, so the error names the derived value as expected.
+> `extract_secret_impl` and `search_for_swap_tx_spend` compare the
+> `dhash160` of a revealed secret with the derived value instead of the
+> shared one, which for a 32-byte shared value could never match.
+> Unchanged, with reasons: the swap id (`qrc20_swap_id`, over the shared
+> value on both sides); the refund (`refund_hash_time_locked_payment`,
+> `sender_refund_output`) and `wait_for_tx_spend_impl`, which read the
+> `secret_hash` of the payment transaction, already the derived value; the
+> trade-fee estimate, which uses a 20-byte dummy. The QRC20 path is covered
+> by unit tests only (`r72a_qrc20_*` in `qrc20_tests.rs`; run on 2026-11-08:
+> 9 passed); the live lab row is Siacoin against an EVM token. The v2 EVM
+> swap contracts take 32-byte hashes (`bytes32`) and the TRON V1 path has no
+> secret hash; neither is affected.
 
 **R74.** *Which key each side puts on the wire under a global-HD login.*
 *(Passed the KDF Dirty Gate on 2026-11-04, measure 0.04. Reference fact, Spec Reader 2026-11-04, rows
@@ -1907,6 +2044,25 @@ Existing unit tests that cover items 1 to 3 and 5:
 `test_recover_funds_should_not_refund_on_the_successful_swap` (items 1 to 3),
 `test_recover_funds_maker_swap_not_finished` and
 `test_recover_funds_maker_swap_maker_payment_refunded` (item 5).
+
+**T33.** *The stale-tip warning (R79-R81).* With a height source and a clock
+that the test controls:
+
+1. a height that has not changed for 59 minutes of observation gives no
+   warning; at 60 minutes it gives exactly one, naming the ticker, the
+   height and 60 minutes;
+2. while the height stays the same, no second warning before 120 minutes; at
+   120 minutes a second one, naming 120 minutes;
+3. a change of height gives no warning and starts a new stall clock; a stall of
+   59 minutes after the change gives none;
+4. a read that fails, or does not finish before the sleep of its step ends, is skipped: it neither warns nor resets the clock, and the
+   observation after it counts from the last successful read;
+5. the first observation of a wait only records the height;
+6. the text of the warning contains the ticker and no address, URL or host;
+7. in the maker's and the taker's refund wait the sleep is cut into slices of
+   at most 5 minutes, the height is read once per 5-minute period (not once per
+   shorter step), the total sleep and the refund decision are those of the
+   unchanged wait, and the warning is written once the stall reaches 60 minutes.
 
 ## 51.13 Deferred Work
 

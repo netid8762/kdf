@@ -3803,7 +3803,8 @@ mod t32_k1b_final_cancel_tests {
 mod t12_7c_restore_guard_tests {
     use super::*;
     use crate::mm2::database::my_orders::CREATE_MY_ORDERS_TABLE;
-    use crate::mm2::lp_ordermatch::my_orders_storage::{delete_active_maker_order_attempt, MyOrdersError};
+    use crate::mm2::lp_ordermatch::my_orders_storage::{delete_active_maker_order_attempt,
+                                                       delete_active_taker_order_attempt, MyOrdersError};
     use common::log::log_crate::{set_logger, set_max_level, Level, LevelFilter, Log, Metadata, Record};
     use futures::compat::Future01CompatExt;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -4233,6 +4234,281 @@ mod t12_7c_restore_guard_tests {
         let ordermatch_ctx = OrdermatchContext::from_ctx(&node.ctx).unwrap();
         let taker_orders = block_on(ordermatch_ctx.my_taker_orders.lock());
         assert!(taker_orders.contains_key(&order.request.uuid));
+    }
+
+    // B4-1 (CRD ch.32 R-GH8a, as built): a failed history write deletes the active record just written.
+
+    /// The history database loses its orders table, so the history write of a new order fails.
+    fn break_history_database(node: &Node) {
+        node.ctx
+            .sqlite_connection()
+            .execute("DROP TABLE my_orders", [])
+            .unwrap();
+    }
+
+    #[test]
+    fn t_b4_1_a_maker_failed_history_write_leaves_no_active_record() {
+        let mut node = Node::new(json!({}));
+        break_history_database(&node);
+        let order = maker(true);
+
+        let err = block_on(save_my_new_maker_order(node.ctx.clone(), &order)).unwrap_err();
+
+        assert!(matches!(err.get_inner(), MyOrdersError::ErrorSaving(_)), "{err}");
+        assert!(!node.active_file(&order.uuid));
+        let stored = block_on(node.storage().load_active_maker_orders()).unwrap();
+        assert!(stored.iter().all(|stored| stored.uuid != order.uuid));
+        // A restart does not bring the order back.
+        node.restore();
+        assert!(!node.restored_makers().contains(&order.uuid));
+        node.assert_nothing_published();
+    }
+
+    #[test]
+    fn t_b4_1_b_taker_failed_history_write_leaves_no_active_record() {
+        let node = Node::new(json!({}));
+        break_history_database(&node);
+        let order = taker(true);
+
+        let err = block_on(save_my_new_taker_order(node.ctx.clone(), &order)).unwrap_err();
+
+        assert!(matches!(err.get_inner(), MyOrdersError::ErrorSaving(_)), "{err}");
+        assert!(!my_taker_order_file_path(&node.ctx, &order.request.uuid).exists());
+        let stored = block_on(node.storage().load_active_taker_orders()).unwrap();
+        assert!(stored.iter().all(|stored| stored.request.uuid != order.request.uuid));
+        // A restart does not bring the order back.
+        node.restore();
+        let ordermatch_ctx = OrdermatchContext::from_ctx(&node.ctx).unwrap();
+        let taker_orders = block_on(ordermatch_ctx.my_taker_orders.lock());
+        assert!(!taker_orders.contains_key(&order.request.uuid));
+    }
+
+    /// The other orders that are stored stay: only the record of the failed order goes.
+    #[test]
+    fn t_b4_1_c_a_failed_history_write_deletes_only_its_own_record() {
+        let node = Node::new(json!({}));
+        let kept_maker = maker(false);
+        let kept_taker = taker(false);
+        block_on(save_my_new_maker_order(node.ctx.clone(), &kept_maker)).unwrap();
+        block_on(save_my_new_taker_order(node.ctx.clone(), &kept_taker)).unwrap();
+        break_history_database(&node);
+
+        assert!(block_on(save_my_new_maker_order(node.ctx.clone(), &maker(true))).is_err());
+        assert!(block_on(save_my_new_taker_order(node.ctx.clone(), &taker(true))).is_err());
+
+        assert!(node.active_file(&kept_maker.uuid));
+        assert!(my_taker_order_file_path(&node.ctx, &kept_taker.request.uuid).exists());
+    }
+
+    /// An order that is not kept in the history has no history write to fail: its record stays.
+    #[test]
+    fn t_b4_1_d_an_order_outside_the_history_keeps_its_record() {
+        let node = Node::new(json!({}));
+        break_history_database(&node);
+        let maker_order = maker(false);
+        let taker_order = taker(false);
+
+        block_on(save_my_new_maker_order(node.ctx.clone(), &maker_order)).unwrap();
+        block_on(save_my_new_taker_order(node.ctx.clone(), &taker_order)).unwrap();
+
+        assert!(node.active_file(&maker_order.uuid));
+        assert!(my_taker_order_file_path(&node.ctx, &taker_order.request.uuid).exists());
+    }
+
+    /// Regression: a successful save leaves the active record and the history row.
+    #[test]
+    fn t_b4_1_e_a_successful_save_keeps_the_record_and_the_history_row() {
+        let node = Node::new(json!({}));
+        let maker_order = maker(true);
+        let taker_order = taker(true);
+
+        block_on(save_my_new_maker_order(node.ctx.clone(), &maker_order)).unwrap();
+        block_on(save_my_new_taker_order(node.ctx.clone(), &taker_order)).unwrap();
+
+        assert!(node.active_file(&maker_order.uuid));
+        assert!(my_taker_order_file_path(&node.ctx, &taker_order.request.uuid).exists());
+        assert_eq!(node.row(&maker_order.uuid).unwrap().0, "Created");
+        assert_eq!(node.row(&taker_order.request.uuid).unwrap().0, "Created");
+    }
+
+    // B4-1b (CRD ch.12 R7c item 4, ch.32 R-GH8a): the taker record gets the retrying deletion too.
+
+    /// Mocks the taker attempt: it fails `failures` times and then runs the real attempt. Returns the call count.
+    fn mock_taker_attempts_then_real(failures: usize) -> Arc<AtomicUsize> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        delete_active_taker_order_attempt.mock_safe(move |ctx, uuid| {
+            if counted.fetch_add(1, AtomicOrdering::SeqCst) < failures {
+                let err = MmError::err(MyOrdersError::ErrorSaving("disk full".to_owned()));
+                MockResult::Return(Box::new(futures01::future::result(err)))
+            } else {
+                MockResult::Continue((ctx, uuid))
+            }
+        });
+        calls
+    }
+
+    /// The same for the maker attempt.
+    fn mock_maker_attempts_then_real(failures: usize) -> Arc<AtomicUsize> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        delete_active_maker_order_attempt.mock_safe(move |ctx, uuid| {
+            if counted.fetch_add(1, AtomicOrdering::SeqCst) < failures {
+                let err = MmError::err(MyOrdersError::ErrorSaving("disk full".to_owned()));
+                MockResult::Return(Box::new(futures01::future::result(err)))
+            } else {
+                MockResult::Continue((ctx, uuid))
+            }
+        });
+        calls
+    }
+
+    /// The first deletion attempt fails, a later one succeeds: no taker record remains, the history error is
+    /// returned, and the one failed attempt is logged once.
+    #[test]
+    fn t_b4_1b_a_taker_deletion_that_fails_once_and_then_succeeds_leaves_no_record() {
+        let logs = capture_installed();
+        let node = Node::new(json!({}));
+        break_history_database(&node);
+        let order = taker(true);
+        let calls = mock_taker_attempts_then_real(1);
+        let started = Instant::now();
+
+        let err = block_on(save_my_new_taker_order(node.ctx.clone(), &order)).unwrap_err();
+
+        assert!(matches!(err.get_inner(), MyOrdersError::ErrorSaving(_)), "{err}");
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2, "one retry");
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "the attempts are spaced"
+        );
+        assert!(!my_taker_order_file_path(&node.ctx, &order.request.uuid).exists());
+        if logs {
+            let lines = lines_for(order.request.uuid);
+            assert_eq!(lines.len(), 1, "one warn line for the one failed attempt");
+            assert!(lines[0].starts_with("WARN") && lines[0].contains("taker order"));
+            assert!(lines[0].contains("attempt 1 of 3"));
+        }
+    }
+
+    /// A restart after the retried deletion restores no taker order.
+    #[test]
+    fn t_b4_1b_b_a_restart_after_the_retried_deletion_restores_no_taker_order() {
+        let node = Node::new(json!({}));
+        break_history_database(&node);
+        let order = taker(true);
+        let _calls = mock_taker_attempts_then_real(2);
+
+        assert!(block_on(save_my_new_taker_order(node.ctx.clone(), &order)).is_err());
+        node.restore();
+
+        let ordermatch_ctx = OrdermatchContext::from_ctx(&node.ctx).unwrap();
+        let taker_orders = block_on(ordermatch_ctx.my_taker_orders.lock());
+        assert!(!taker_orders.contains_key(&order.request.uuid));
+    }
+
+    /// Every attempt fails: three attempts and no fourth, the same give-up line as the maker's, and the history
+    /// error is still returned.
+    #[test]
+    fn t_b4_1b_c_a_taker_deletion_that_fails_three_times_gives_up_and_names_the_order() {
+        let logs = capture_installed();
+        let node = Node::new(json!({}));
+        break_history_database(&node);
+        let order = taker(true);
+        let calls = mock_taker_attempts_then_real(usize::MAX);
+        let started = Instant::now();
+
+        let err = block_on(save_my_new_taker_order(node.ctx.clone(), &order)).unwrap_err();
+
+        assert!(matches!(err.get_inner(), MyOrdersError::ErrorSaving(_)), "{err}");
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 3, "no fourth attempt");
+        assert!(started.elapsed() >= Duration::from_millis(400), "two pauses");
+        if logs {
+            let lines = lines_for(order.request.uuid);
+            assert_eq!(lines.len(), 4, "three failed attempts and the give-up line");
+            assert!(lines[..3]
+                .iter()
+                .all(|l| l.starts_with("WARN") && l.contains("taker order")));
+            assert!(lines[3].contains("Giving up") && lines[3].contains("taker order"));
+        }
+    }
+
+    /// A record that is already missing counts as deleted by the real attempt, so it adds no warn line.
+    #[test]
+    fn t_b4_1b_d_a_missing_taker_record_counts_as_deleted() {
+        let logs = capture_installed();
+        let node = Node::new(json!({}));
+        let order = taker(false);
+        assert!(!my_taker_order_file_path(&node.ctx, &order.request.uuid).exists());
+
+        block_on(delete_active_taker_order_attempt(node.ctx.clone(), order.request.uuid).compat()).unwrap();
+
+        if logs {
+            assert!(lines_for(order.request.uuid).is_empty());
+        }
+    }
+
+    /// An existing record is deleted at the first attempt, with no pause and no warn line.
+    #[test]
+    fn t_b4_1b_e_an_existing_taker_record_is_deleted_at_the_first_attempt() {
+        let logs = capture_installed();
+        let node = Node::new(json!({}));
+        break_history_database(&node);
+        let order = taker(true);
+        let calls = mock_taker_attempts_then_real(0);
+
+        assert!(block_on(save_my_new_taker_order(node.ctx.clone(), &order)).is_err());
+
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1, "one attempt, no retry");
+        assert!(!my_taker_order_file_path(&node.ctx, &order.request.uuid).exists());
+        if logs {
+            assert!(lines_for(order.request.uuid).is_empty());
+        }
+    }
+
+    /// Regression: the maker save keeps its retrying deletion and its log lines, now through the shared loop.
+    #[test]
+    fn t_b4_1b_f_the_maker_retry_of_the_failed_save_is_unchanged() {
+        let logs = capture_installed();
+        let node = Node::new(json!({}));
+        break_history_database(&node);
+        let order = maker(true);
+        let calls = mock_maker_attempts_then_real(2);
+        let started = Instant::now();
+
+        let err = block_on(save_my_new_maker_order(node.ctx.clone(), &order)).unwrap_err();
+
+        assert!(matches!(err.get_inner(), MyOrdersError::ErrorSaving(_)), "{err}");
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 3);
+        assert!(started.elapsed() >= Duration::from_millis(400), "two pauses");
+        assert!(!node.active_file(&order.uuid));
+        if logs {
+            let lines = lines_for(order.uuid);
+            assert_eq!(lines.len(), 2, "one warn line per failed attempt");
+            assert!(lines[0].contains("Deleting the active record of maker order"));
+            assert!(lines[0].contains("failed (attempt 1 of 3): "));
+            assert!(lines[1].contains("failed (attempt 2 of 3): "));
+            assert!(lines.iter().all(|line| line.contains("disk full")));
+        }
+    }
+
+    /// Regression: the maker give-up line keeps its text.
+    #[test]
+    fn t_b4_1b_g_the_maker_give_up_line_is_unchanged() {
+        let logs = capture_installed();
+        let node = Node::new(json!({}));
+        let order = maker(false);
+        let calls = mock_attempts(3);
+
+        remove(&node, &order);
+
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 3);
+        if logs {
+            let lines = lines_for(order.uuid);
+            assert_eq!(lines.len(), 4);
+            assert!(lines[3].starts_with("WARN Giving up deleting the active record of maker order "));
+            assert!(lines[3].ends_with(" after 3 attempts"));
+        }
     }
 }
 
@@ -6213,11 +6489,13 @@ mod t60_6_pre_trade_spend_check_tests {
     }
 
     /// (a) through the `setprice` path: refused with the typed volume-too-low text, and the operator-set minimum
-    /// volume of an order is what is checked, whether or not one was given.
+    /// volume of an order is what is checked, whether or not one was given. An order with no operator-set minimum
+    /// volume is checked at the plain default of R60.4.2 step 3, so the raise of R60.6.8 is off here
+    /// (`spend_safe_min_volume` false; with it on, such an order carries a safe default instead, see T60.8).
     #[test]
     fn t60_6_setprice_is_refused_before_anything_else_happens() {
         mock_coins(false);
-        let ctx = ctx_with(json!({}), &["DYN", "KMD"]);
+        let ctx = ctx_with(json!({ "spend_safe_min_volume": false }), &["DYN", "KMD"]);
         for body in [
             json!({"base": "DYN", "rel": "KMD", "price": "1", "volume": "1", "min_volume": "0.0001"}),
             json!({"base": "DYN", "rel": "KMD", "price": "1", "volume": "1"}),
@@ -6506,6 +6784,438 @@ mod t60_6_pre_trade_spend_check_tests {
             let (refusals, fetches) = two_price_only_updates(json!({"fee_estimate_cache_secs": 0}));
             assert!(refusals.iter().all(|r| r.contains("is too low, required at least")));
             assert_eq!(fetches, 2);
+        }
+    }
+
+    /// CRD ch.60 T60.8: the raised default minimum volume of a maker order (R60.6.8). The coins are those of T60.6:
+    /// `DYN` (dynamic fee, `S` = 10,920 base units), `KMD` (`S` = 1,496), `PLAIN` and `PLAIN2` (not covered, which
+    /// is what an EVM coin is, R60.6.7 item 1); every floor is 0.0001. `setprice` runs end to end against a
+    /// temporary order directory, and the assertions read the `min_volume` the order record carries, which is
+    /// what peers see (R60.5.1, W1).
+    mod t60_8_raised_default_min_volume {
+        use super::*;
+        use coins::{CoinBalance, TradeFee};
+
+        /// A node with the four coins, a temporary order directory and a channel that receives what it publishes.
+        struct Node {
+            ctx: MmArc,
+            dbdir: std::path::PathBuf,
+            _p2p_rx: mpsc::Receiver<AdexBehaviourCmd>,
+        }
+
+        impl Drop for Node {
+            fn drop(&mut self) { std::fs::remove_dir_all(&self.dbdir).ok(); }
+        }
+
+        /// The coin mocks of T60.6 plus a balance of `balance` and zero trade fees, so that `setprice` and an
+        /// update run without a network.
+        fn mock_node_coins(estimate_fails: bool, balance: &'static str) {
+            mock_coins(estimate_fails);
+            TestCoin::min_tx_amount.mock_safe(|_| MockResult::Return(BigDecimal::from(0)));
+            TestCoin::my_balance.mock_safe(move |_| {
+                MockResult::Return(Box::new(futures01::future::ok(CoinBalance::new(
+                    balance.parse::<BigDecimal>().unwrap(),
+                ))))
+            });
+            TestCoin::get_sender_trade_fee.mock_safe(|coin, _value, _stage| {
+                let fee = TradeFee {
+                    coin: coin.ticker().to_owned(),
+                    amount: MmNumber::from(0),
+                    paid_from_trading_vol: false,
+                };
+                MockResult::Return(Box::pin(async move { Ok(fee) }))
+            });
+            TestCoin::get_receiver_trade_fee.mock_safe(|coin, _stage| {
+                let fee = TradeFee {
+                    coin: coin.ticker().to_owned(),
+                    amount: MmNumber::from(0),
+                    paid_from_trading_vol: false,
+                };
+                MockResult::Return(Box::new(futures01::future::ok(fee)))
+            });
+        }
+
+        /// `extra` is merged into the top-level configuration.
+        fn node(extra: Json) -> Node {
+            let dbdir = std::env::temp_dir().join(format!("kdf-t60-8-{}", Uuid::new_v4()));
+            let mut conf = json!({
+                "coins": [{ "coin": "DYN" }, { "coin": "KMD" }, { "coin": "PLAIN" }, { "coin": "PLAIN2" }],
+                "dbdir": dbdir.to_str().unwrap()
+            });
+            for (key, value) in extra.as_object().unwrap() {
+                conf[key] = value.clone();
+            }
+            let ctx = MmCtxBuilder::new()
+                .with_conf(conf)
+                .with_secp256k1_key_pair(key_pair_from_seed("passphrase").unwrap())
+                .into_mm_arc();
+            let (tx, p2p_rx) = mpsc::channel(100);
+            P2PContext::new(tx).store_to_mm_arc(&ctx);
+            std::fs::create_dir_all(my_maker_orders_dir(&ctx)).unwrap();
+            let coins_ctx = CoinsContext::from_ctx(&ctx).unwrap();
+            for ticker in ["DYN", "KMD", "PLAIN", "PLAIN2"] {
+                block_on(coins_ctx.add_coin(MmCoinEnum::Test(TestCoin::new(ticker)))).unwrap();
+            }
+            Node {
+                ctx,
+                dbdir,
+                _p2p_rx: p2p_rx,
+            }
+        }
+
+        fn setprice(node: &Node, mut body: Json) -> Result<MakerOrder, String> {
+            body["save_in_history"] = json!(false);
+            let req: SetPriceReq = json::from_value(body).unwrap();
+            block_on(create_maker_order(&node.ctx, req))
+        }
+
+        /// The `min_volume` the order record carries, as a number of base units of 10^-8.
+        fn min_volume_of(order: &MakerOrder) -> MmNumber { order.min_base_vol.clone() }
+
+        /// (a): a `setprice` without `min_volume`, a maximum volume of 1 and a rel coin that is not covered
+        /// advertises ten times `S` of the base coin: 0.001092.
+        #[test]
+        fn t60_8_a_the_default_is_ten_times_the_safe_amount() {
+            mock_node_coins(false, "100");
+            let node = node(json!({}));
+            let order = setprice(
+                &node,
+                json!({"base": "DYN", "rel": "PLAIN", "price": "1", "volume": "1"}),
+            )
+            .unwrap();
+            assert_eq!(min_volume_of(&order), units_8(109_200));
+            assert_eq!(order.max_base_vol, MmNumber::from(1));
+        }
+
+        /// (b): with the switch off the same order advertises `max(b, q / p)`. The pre-trade check of R60.6.7 is
+        /// independent: with it on, that default is refused on `DYN` as before (its floor is below `S`), and with
+        /// it off the order is accepted at the floor. Only an explicit JSON `false` turns the raise off.
+        #[test]
+        fn t60_8_b_switch_off_gives_the_plain_default() {
+            mock_node_coins(false, "100");
+            let body = json!({"base": "DYN", "rel": "PLAIN", "price": "1", "volume": "1"});
+
+            let node_off = node(json!({ "spend_safe_min_volume": false, "pre_trade_spend_check": false }));
+            let order = setprice(&node_off, body.clone()).unwrap();
+            assert_eq!(min_volume_of(&order), units_8(10_000));
+
+            let node_check_on = node(json!({ "spend_safe_min_volume": false }));
+            let err = setprice(&node_check_on, body.clone()).unwrap_err();
+            assert!(
+                err.contains("The volume 0.0001 of the DYN coin is too low, required at least 0.0001092"),
+                "{err}"
+            );
+
+            // The raise is independent of the check: with the check off and the raise on it still applies.
+            let node_raise_only = node(json!({ "pre_trade_spend_check": false }));
+            let order = setprice(&node_raise_only, body).unwrap();
+            assert_eq!(min_volume_of(&order), units_8(109_200));
+
+            for (conf, enabled) in [
+                (json!({}), true),
+                (json!({ "spend_safe_min_volume": true }), true),
+                (json!({ "spend_safe_min_volume": null }), true),
+                (json!({ "spend_safe_min_volume": "false" }), true),
+                (json!({ "spend_safe_min_volume": 0 }), true),
+                (json!({ "spend_safe_min_volume": false }), false),
+            ] {
+                let ctx = ctx_with(conf.clone(), &[]);
+                assert_eq!(spend_safe_min_volume_enabled(&ctx), enabled, "{conf}");
+            }
+        }
+
+        /// (c): with KMD as base (`S` = 1,496 base units) the default is 0.0001496 instead of the floor 0.0001.
+        #[test]
+        fn t60_8_c_kmd_default_is_above_the_floor() {
+            mock_node_coins(false, "100");
+            let node = node(json!({}));
+            let order = setprice(
+                &node,
+                json!({"base": "KMD", "rel": "PLAIN", "price": "1", "volume": "1"}),
+            )
+            .unwrap();
+            assert_eq!(min_volume_of(&order), units_8(14_960));
+        }
+
+        /// (d): with coins that R60.6.7 item 1 does not cover on both legs (an EVM coin is one) the default is
+        /// `max(b, q / p)`, with the rel floor decided by the price.
+        #[test]
+        fn t60_8_d_uncovered_coins_keep_the_plain_default() {
+            mock_node_coins(false, "100");
+            let node = node(json!({}));
+            let order = setprice(
+                &node,
+                json!({"base": "PLAIN", "rel": "PLAIN2", "price": "1", "volume": "1"}),
+            )
+            .unwrap();
+            assert_eq!(min_volume_of(&order), units_8(10_000));
+            // q / p = 0.0001 / 0.25 = 0.0004 is above the base floor.
+            let order = setprice(
+                &node,
+                json!({"base": "PLAIN", "rel": "PLAIN2", "price": "0.25", "volume": "1"}),
+            )
+            .unwrap();
+            assert_eq!(min_volume_of(&order), units_8(40_000));
+        }
+
+        /// (e): with a covered rel coin the default is the largest of the four terms, the rel term divided by the
+        /// price: `10 * S_rel / p` against `10 * S_base` (and the floors).
+        #[test]
+        fn t60_8_e_the_largest_term_of_both_legs_wins() {
+            mock_node_coins(false, "100");
+            let node = node(json!({}));
+            // Price 0.5: 10 * 10,920 / 0.5 = 218,400 base units beats 10 * 1,496 = 14,960 and 0.0002.
+            let order = setprice(
+                &node,
+                json!({"base": "KMD", "rel": "DYN", "price": "0.5", "volume": "1"}),
+            )
+            .unwrap();
+            assert_eq!(min_volume_of(&order), units_8(218_400));
+            // Price 10: 10 * 10,920 / 10 = 10,920 is below 10 * 1,496 = 14,960, so the base term wins.
+            let order = setprice(
+                &node,
+                json!({"base": "KMD", "rel": "DYN", "price": "10", "volume": "1"}),
+            )
+            .unwrap();
+            assert_eq!(min_volume_of(&order), units_8(14_960));
+            // Both legs covered by the same kind of coin, base `DYN`: its own term, 10 * 10,920.
+            let order = setprice(&node, json!({"base": "DYN", "rel": "KMD", "price": "1", "volume": "1"})).unwrap();
+            assert_eq!(min_volume_of(&order), units_8(109_200));
+        }
+
+        /// (f): an operator-set `min_volume` is kept as set, however it compares with the raised value.
+        #[test]
+        fn t60_8_f_an_operator_set_minimum_is_kept() {
+            mock_node_coins(false, "100");
+            let node = node(json!({}));
+            for minimum in ["0.0002", "0.01"] {
+                let body = json!({
+                    "base": "DYN", "rel": "PLAIN", "price": "1", "volume": "1", "min_volume": minimum
+                });
+                let order = setprice(&node, body).unwrap();
+                assert_eq!(min_volume_of(&order), MmNumber::from(minimum));
+            }
+        }
+
+        /// (g): a maximum volume of 0.0005 gives a default of 0.0005 (the cap), and the order trades only whole.
+        /// The cap never takes the default below `max(b, q / p)`: a maximum volume under that is refused by
+        /// R60.4.2 as before. A maximum volume under `S` is refused by R60.6.7 at the capped default.
+        #[test]
+        fn t60_8_g_the_default_is_capped_at_the_maximum_volume() {
+            mock_node_coins(false, "100");
+            let node = node(json!({}));
+            let order = setprice(
+                &node,
+                json!({"base": "DYN", "rel": "PLAIN", "price": "1", "volume": "0.0005"}),
+            )
+            .unwrap();
+            assert_eq!(min_volume_of(&order), units_8(50_000));
+            assert_eq!(order.max_base_vol, MmNumber::from("0.0005"));
+            assert_eq!(order.min_base_vol, order.max_base_vol);
+
+            // KMD: the raised value 0.0001496 is above the maximum volume 0.00012, which is above the floor.
+            let order = setprice(
+                &node,
+                json!({"base": "KMD", "rel": "PLAIN", "price": "1", "volume": "0.00012"}),
+            )
+            .unwrap();
+            assert_eq!(min_volume_of(&order), units_8(12_000));
+
+            // Below the floor the order is refused by the floors, as without the raise.
+            let err = setprice(
+                &node,
+                json!({"base": "KMD", "rel": "PLAIN", "price": "1", "volume": "0.00005"}),
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("Max base vol 0.00005 is too low, required: 0.0001"),
+                "{err}"
+            );
+
+            // At the floor of `DYN` the capped default 0.0001 is below `S`: refused by R60.6.7.
+            let err = setprice(
+                &node,
+                json!({"base": "DYN", "rel": "PLAIN", "price": "1", "volume": "0.0001"}),
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("The volume 0.0001 of the DYN coin is too low, required at least 0.0001092"),
+                "{err}"
+            );
+        }
+
+        /// (g), `max` order: the volume is known only after the balance read, so the capped default is checked
+        /// then. A balance of 0.0001 gives a maximum volume under `S` of `DYN`.
+        #[test]
+        fn t60_8_g_a_max_order_is_checked_at_its_capped_default() {
+            mock_node_coins(false, "0.0001");
+            let node = node(json!({}));
+            let err = setprice(&node, json!({"base": "DYN", "rel": "PLAIN", "price": "1", "max": true})).unwrap_err();
+            assert!(
+                err.contains("of the DYN coin is too low, required at least 0.0001092"),
+                "{err}"
+            );
+        }
+
+        /// The cap in isolation: it never takes the default below the plain one.
+        #[test]
+        fn t60_8_g_the_cap_never_goes_below_the_plain_default() {
+            let plain = units_8(10_000);
+            let term = units_8(109_200);
+            assert_eq!(raised_default_capped(plain.clone(), &term, &MmNumber::from(1)), term);
+            assert_eq!(
+                raised_default_capped(plain.clone(), &term, &units_8(50_000)),
+                units_8(50_000)
+            );
+            assert_eq!(raised_default_capped(plain.clone(), &term, &units_8(5_000)), plain);
+        }
+
+        /// (h): today an `update_maker_order` without `min_volume` does not recompute the default; the order
+        /// keeps the value it carries, even after the fee estimate moved, and the update re-checks it as before.
+        #[test]
+        fn t60_8_h_an_update_keeps_the_stored_default() {
+            mock_node_coins(false, "100");
+            let node = node(json!({}));
+            let order = setprice(
+                &node,
+                json!({"base": "DYN", "rel": "PLAIN", "price": "1", "volume": "1"}),
+            )
+            .unwrap();
+            assert_eq!(min_volume_of(&order), units_8(109_200));
+
+            // The estimate doubles after the order was placed; a recomputed default would follow it.
+            TestCoin::spend_safe_amount.mock_safe(|coin| {
+                let safe_amount = match coin.ticker() {
+                    "DYN" => Some(units_8(21_840)),
+                    _ => None,
+                };
+                MockResult::Return(Box::pin(async move { Ok(safe_amount) }))
+            });
+            let updated = block_on(update_maker_order(&node.ctx, MakerOrderUpdateReq {
+                uuid: order.uuid,
+                new_price: Some(MmNumber::from("2")),
+                max: None,
+                volume_delta: None,
+                min_volume: None,
+                base_confs: None,
+                base_nota: None,
+                rel_confs: None,
+                rel_nota: None,
+            }))
+            .unwrap();
+            assert_eq!(updated.price, MmNumber::from("2"));
+            assert_eq!(min_volume_of(&updated), units_8(109_200));
+        }
+
+        /// (j): the maker `trade_preimage` of the order of (a) is not refused: it previews the order with the same
+        /// raised default as `setprice`, so the preview and the order agree. With the raise off the preview is
+        /// refused as in T60.6 (d), with the estimate unavailable it is refused with the typed error, and the
+        /// taker previews, which keep their default, are refused either way.
+        #[test]
+        fn t60_8_j_the_maker_preview_takes_the_raised_default() {
+            use crate::mm2::lp_swap::trade_preimage_rpc;
+
+            let preview = |node: &Node, method: &str, extra: Json| {
+                let mut body =
+                    json!({"base": "DYN", "rel": "PLAIN", "swap_method": method, "price": "1", "volume": "1"});
+                for (key, value) in extra.as_object().unwrap() {
+                    body[key] = value.clone();
+                }
+                let req = json::from_value(body).unwrap();
+                block_on(trade_preimage_rpc(node.ctx.clone(), req))
+            };
+
+            mock_node_coins(false, "100");
+            let node_on = node(json!({}));
+            assert!(preview(&node_on, "setprice", json!({})).is_ok());
+            // The order of (a) is accepted at the same value.
+            assert!(setprice(
+                &node_on,
+                json!({"base": "DYN", "rel": "PLAIN", "price": "1", "volume": "1"})
+            )
+            .is_ok());
+
+            // A `max` preview is checked at its capped default once the volume is known: a balance of 0.0001 gives
+            // a maximum volume under `S`.
+            mock_node_coins(false, "0.0001");
+            let err = match preview(&node_on, "setprice", json!({ "max": true })) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("the preview must be refused"),
+            };
+            assert!(err.contains("0.0001092"), "{err}");
+
+            mock_node_coins(false, "100");
+            let node_off = node(json!({ "spend_safe_min_volume": false }));
+            let err = match preview(&node_off, "setprice", json!({})) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("the preview must be refused with the raise off"),
+            };
+            assert!(err.contains("0.0001092"), "{err}");
+
+            // The taker previews keep the plain default and are refused as in T60.6 (d).
+            for method in ["sell", "buy"] {
+                let err = match preview(&node_on, method, json!({})) {
+                    Err(e) => e.to_string(),
+                    Ok(_) => panic!("the {method} preview must be refused"),
+                };
+                assert!(err.contains("0.0001092"), "{method}: {err}");
+            }
+
+            mock_node_coins(true, "100");
+            let node_failing = node(json!({}));
+            let err = match preview(&node_failing, "setprice", json!({})) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("the preview must be refused"),
+            };
+            assert!(err.contains("Cannot check the DYN coin spend safety"), "{err}");
+        }
+
+        /// (i), R60.6.8 item 4: when the fee estimate of a covered coin is unavailable, with `pre_trade_spend_check`
+        /// on the `setprice` is refused with the typed error of R60.6.7 item 6; with it off no raised term is formed
+        /// and the order gets the plain default, with no refusal. With the raise off the estimate is not consulted.
+        /// The single WARN of the fallback (the pair only) is covered by construction: the helper logs it on the one
+        /// path that returns `Ok(None)` for an unavailable estimate. No log-capture seam is shared with this module.
+        #[test]
+        fn t60_8_i_an_unavailable_estimate_is_a_typed_refusal() {
+            mock_node_coins(true, "100");
+            let body = json!({"base": "DYN", "rel": "PLAIN", "price": "1", "volume": "1"});
+
+            let node_check_on = node(json!({}));
+            let err = setprice(&node_check_on, body.clone()).unwrap_err();
+            assert!(err.contains("Cannot check the DYN coin spend safety: "), "{err}");
+
+            let node_check_off = node(json!({ "pre_trade_spend_check": false }));
+            let order = setprice(&node_check_off, body.clone()).unwrap();
+            assert_eq!(min_volume_of(&order), units_8(10_000));
+
+            let node_raise_off = node(json!({ "spend_safe_min_volume": false, "pre_trade_spend_check": false }));
+            let order = setprice(&node_raise_off, body).unwrap();
+            assert_eq!(min_volume_of(&order), units_8(10_000));
+        }
+
+        /// (i) for the maker preview: the same rule as for `setprice`, so the preview and the order agree.
+        #[test]
+        fn t60_8_i_the_maker_preview_follows_the_same_rule_for_an_unavailable_estimate() {
+            use crate::mm2::lp_swap::trade_preimage_rpc;
+
+            mock_node_coins(true, "100");
+            let preview = |node: &Node| {
+                let req = json::from_value(json!({
+                    "base": "DYN", "rel": "PLAIN", "swap_method": "setprice", "price": "1", "volume": "1"
+                }))
+                .unwrap();
+                block_on(trade_preimage_rpc(node.ctx.clone(), req))
+            };
+
+            let node_check_on = node(json!({}));
+            let err = match preview(&node_check_on) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("the preview must be refused"),
+            };
+            assert!(err.contains("Cannot check the DYN coin spend safety"), "{err}");
+
+            let node_check_off = node(json!({ "pre_trade_spend_check": false }));
+            assert!(preview(&node_check_off).is_ok());
         }
     }
 
@@ -10672,6 +11382,429 @@ mod t60_7_maker_balance_watch_tests {
         // Only the order that stayed was announced (the mock is the same for both bases, so it was lowered too).
         assert_eq!(publishes(&mut p2p_rx), 1);
         assert!(ordermatch_ctx.maker_orders_ctx.lock().contains_key(&kept.uuid));
+    }
+
+    /// CRD ch.32 R-GH8a, T-GH8a: with `setprice_replace_after_checks` on, `setprice` with `cancel_previous`
+    /// replaces the previous orders of the pair only after every check and the build of the new order passed.
+    mod t_gh8a_replace_after_checks {
+        use super::super::maker_publication_tests::drain;
+        use super::*;
+        use crate::mm2::lp_ordermatch::new_protocol::OrdermatchMessage;
+
+        const PAIR: &str = "BASE:REL";
+
+        /// A message of the maker order flow that left the node.
+        #[derive(Debug, PartialEq)]
+        enum Sent {
+            Created(Uuid),
+            Cancelled(Uuid),
+        }
+
+        /// A node with the coins `BASE` and `REL`, the scripted balance of `Probe` and a channel that receives what
+        /// the node publishes.
+        struct Maker {
+            ctx: MmArc,
+            dbdir: std::path::PathBuf,
+            rx: mpsc::Receiver<AdexBehaviourCmd>,
+            probe: Probe,
+        }
+
+        impl Drop for Maker {
+            fn drop(&mut self) { std::fs::remove_dir_all(&self.dbdir).ok(); }
+        }
+
+        impl Maker {
+            /// `extra` is merged into the top-level configuration.
+            fn new(extra: Json) -> Maker {
+                let probe = Probe::install("42");
+                let dbdir = std::env::temp_dir().join(format!("kdf-gh8a-{}", Uuid::new_v4()));
+                let mut conf = json!({
+                    "coins": [{ "coin": "BASE" }, { "coin": "REL" }],
+                    "dbdir": dbdir.to_str().unwrap()
+                });
+                for (key, value) in extra.as_object().unwrap() {
+                    conf[key] = value.clone();
+                }
+                let ctx = MmCtxBuilder::new()
+                    .with_conf(conf)
+                    .with_secp256k1_key_pair(key_pair_from_seed("passphrase").unwrap())
+                    .into_mm_arc();
+                let (tx, rx) = mpsc::channel(1000);
+                P2PContext::new(tx).store_to_mm_arc(&ctx);
+                std::fs::create_dir_all(my_maker_orders_dir(&ctx)).unwrap();
+                let coins_ctx = CoinsContext::from_ctx(&ctx).unwrap();
+                for ticker in ["BASE", "REL"] {
+                    block_on(coins_ctx.add_coin(MmCoinEnum::Test(TestCoin::new(ticker)))).unwrap();
+                }
+                Maker { ctx, dbdir, rx, probe }
+            }
+
+            fn ordermatch_ctx(&self) -> Arc<OrdermatchContext> { OrdermatchContext::from_ctx(&self.ctx).unwrap() }
+
+            /// `setprice` of `volume` BASE at price 1, with an optional minimum volume.
+            fn set_price(
+                &self,
+                cancel_previous: bool,
+                volume: i64,
+                min_volume: Option<i64>,
+            ) -> Result<MakerOrder, String> {
+                self.set_price_with_history(cancel_previous, volume, min_volume, false)
+            }
+
+            /// As `set_price`, with the choice of `save_in_history`: the history write is the one that can fail
+            /// when the order is saved.
+            fn set_price_with_history(
+                &self,
+                cancel_previous: bool,
+                volume: i64,
+                min_volume: Option<i64>,
+                save_in_history: bool,
+            ) -> Result<MakerOrder, String> {
+                let req: SetPriceReq = json::from_value(json!({
+                    "base": "BASE", "rel": "REL", "price": 1, "volume": volume, "min_volume": min_volume,
+                    "cancel_previous": cancel_previous, "save_in_history": save_in_history
+                }))
+                .unwrap();
+                block_on(create_maker_order(&self.ctx, req))
+            }
+
+            /// Two orders on (BASE, REL), created without `cancel_previous`; what was published meanwhile and the
+            /// reads of the balance are forgotten.
+            fn two_previous_orders(&mut self) -> HashSet<Uuid> {
+                let previous: HashSet<Uuid> = (0..2).map(|_| placed(self.set_price(false, 3, None)).uuid).collect();
+                flush_trie(&self.ctx);
+                assert_eq!(self.sent().len(), 2);
+                self.probe.log.lock().unwrap().clear();
+                previous
+            }
+
+            /// The created and cancelled messages published since the last call, in publication order.
+            fn sent(&mut self) -> Vec<Sent> {
+                drain(&mut self.rx)
+                    .into_iter()
+                    .filter_map(|published| match published.message {
+                        OrdermatchMessage::MakerOrderCreated(created) => Some(Sent::Created(created.uuid.into())),
+                        OrdermatchMessage::MakerOrderCancelled(cancelled) => {
+                            Some(Sent::Cancelled(cancelled.uuid.into()))
+                        },
+                        _ => None,
+                    })
+                    .collect()
+            }
+
+            /// The own orders of the maker.
+            fn own_orders(&self) -> HashSet<Uuid> {
+                self.ordermatch_ctx()
+                    .maker_orders_ctx
+                    .lock()
+                    .clone_orders()
+                    .keys()
+                    .copied()
+                    .collect()
+            }
+
+            fn in_book(&self, uuid: &Uuid) -> bool {
+                flush_trie(&self.ctx);
+                self.ordermatch_ctx()
+                    .orderbook
+                    .lock()
+                    .find_order_by_uuid(uuid)
+                    .is_some()
+            }
+
+            /// The root the trie holds for the pair of the maker's own orders.
+            fn held_root(&self) -> H64 {
+                flush_trie(&self.ctx);
+                let pubkey = hex::encode(self.ctx.secp256k1_key_pair().public_slice());
+                pair_trie_root_by_pub_ctx(&self.ordermatch_ctx(), &pubkey, PAIR)
+            }
+
+            /// Nothing happened to the pair: the same orders in the maker's set, in the book and under the held
+            /// root, and nothing published.
+            fn assert_pair_unchanged(&mut self, previous: &HashSet<Uuid>, root: H64) {
+                assert_eq!(&self.own_orders(), previous);
+                assert!(previous.iter().all(|uuid| self.in_book(uuid)));
+                assert_eq!(self.held_root(), root);
+                assert_eq!(self.sent(), Vec::<Sent>::new(), "no cancel and no created message");
+            }
+        }
+
+        fn placed(result: Result<MakerOrder, String>) -> MakerOrder {
+            match result {
+                Ok(order) => order,
+                Err(e) => panic!("the order must be placed: {e}"),
+            }
+        }
+
+        fn refused(result: Result<MakerOrder, String>) -> String {
+            match result {
+                Ok(order) => panic!("the order {} must be refused", order.uuid),
+                Err(e) => e,
+            }
+        }
+
+        /// A balance check that fails once, then passes: the first read of the balance fails.
+        fn fail_the_next_balance_check(maker: &Maker) { maker.probe.script(&[None]); }
+
+        /// T-GH8a bullet 1: the balance check fails, the error is returned, both previous orders are in the
+        /// maker's set and under the pair's held root, and no cancel message is published.
+        #[test]
+        fn t_gh8a_a_failed_balance_check_leaves_the_previous_orders() {
+            let mut maker = Maker::new(json!({ "setprice_replace_after_checks": true }));
+            let previous = maker.two_previous_orders();
+            let root = maker.held_root();
+            fail_the_next_balance_check(&maker);
+
+            assert!(maker.set_price(true, 3, None).is_err());
+
+            maker.assert_pair_unchanged(&previous, root);
+        }
+
+        /// T-GH8a bullet 2: the checks pass, the builder refuses the order (a volume below its minimum); the
+        /// pair is left as in bullet 1. The balance was read, so the checks ran before the build.
+        #[test]
+        fn t_gh8a_b_a_refused_build_leaves_the_previous_orders() {
+            let mut maker = Maker::new(json!({ "setprice_replace_after_checks": true }));
+            let previous = maker.two_previous_orders();
+            let root = maker.held_root();
+
+            let err = refused(maker.set_price(true, 1, Some(2)));
+
+            assert!(err.contains("below min base vol"), "{err}");
+            assert_eq!(maker.probe.count("read BASE"), 1, "the balance check ran first");
+            maker.assert_pair_unchanged(&previous, root);
+        }
+
+        /// T-GH8a, item 2 of R-GH8a: the save of the new order comes before the first cancel. The history database
+        /// of the node has no orders table, so the history write of the new order (`save_in_history`) fails: the
+        /// error is returned, both previous orders stay in the maker's set, in the book and under the held root,
+        /// no cancel and no created message is published, and no new order exists.
+        #[test]
+        fn t_gh8a_f_a_failed_save_leaves_the_previous_orders() {
+            let mut maker = Maker::new(json!({ "setprice_replace_after_checks": true }));
+            let previous = maker.two_previous_orders();
+            let root = maker.held_root();
+            let connection = db_common::sqlite::rusqlite::Connection::open_in_memory().unwrap();
+            let _ = maker
+                .ctx
+                .sqlite_connection
+                .pin(Arc::new(std::sync::Mutex::new(connection)));
+
+            let err = refused(maker.set_price_with_history(true, 3, None, true));
+
+            assert!(err.contains("Error saving an order"), "{err}");
+            assert_eq!(maker.probe.count("read BASE"), 1, "the balance check ran first");
+            maker.assert_pair_unchanged(&previous, root);
+        }
+
+        /// R-GH8a, the orphan residual: a `setprice` whose history write fails returns the error and leaves no
+        /// active record of the new order, so a restart cannot restore it. It holds at the default and with the
+        /// switch on.
+        #[test]
+        fn t_gh8a_g_a_failed_history_write_leaves_no_active_record_of_the_new_order() {
+            for extra in [json!({}), json!({ "setprice_replace_after_checks": true })] {
+                let maker = Maker::new(extra.clone());
+                let connection = db_common::sqlite::rusqlite::Connection::open_in_memory().unwrap();
+                let _ = maker
+                    .ctx
+                    .sqlite_connection
+                    .pin(Arc::new(std::sync::Mutex::new(connection)));
+
+                let err = refused(maker.set_price_with_history(false, 3, None, true));
+
+                assert!(err.contains("Error saving an order"), "{extra}: {err}");
+                let stored = block_on(MyOrdersStorage::new(maker.ctx.clone()).load_active_maker_orders()).unwrap();
+                assert!(stored.is_empty(), "{extra}: {stored:?}");
+                assert_eq!(maker.own_orders(), HashSet::new(), "{extra}");
+                std::fs::create_dir_all(my_taker_orders_dir(&maker.ctx)).unwrap();
+                block_on(orders_kick_start(&maker.ctx)).unwrap();
+                assert_eq!(
+                    maker.own_orders(),
+                    HashSet::new(),
+                    "{extra}: restored at the next start"
+                );
+            }
+        }
+
+        /// `buy` of 3 BASE at price 1 on the node, through `lp_auto_buy`, with the choice of `save_in_history`.
+        fn buy(maker: &Maker, save_in_history: bool) -> Result<String, String> {
+            let base = block_on(lp_coinfind(&maker.ctx, "BASE")).unwrap().unwrap();
+            let rel = block_on(lp_coinfind(&maker.ctx, "REL")).unwrap().unwrap();
+            let input: AutoBuyInput = json::from_value(json!({
+                "base": "BASE", "rel": "REL", "price": 1, "volume": 3, "method": "buy",
+                "save_in_history": save_in_history
+            }))
+            .unwrap();
+            block_on(lp_auto_buy(&maker.ctx, &base, &rel, input))
+        }
+
+        /// The taker requests that left the node.
+        fn taker_requests(maker: &mut Maker) -> usize {
+            drain(&mut maker.rx)
+                .into_iter()
+                .filter(|published| matches!(published.message, OrdermatchMessage::TakerRequest(_)))
+                .count()
+        }
+
+        /// R-GH8a, the taker path: a `buy` whose history write fails returns the error, subscribes to no topic,
+        /// publishes no taker request, keeps no active taker record and inserts no taker order, so a restart
+        /// restores nothing.
+        #[test]
+        fn t_gh8a_h_a_failed_taker_save_sends_no_request() {
+            let mut maker = Maker::new(json!({}));
+            std::fs::create_dir_all(my_taker_orders_dir(&maker.ctx)).unwrap();
+            let connection = db_common::sqlite::rusqlite::Connection::open_in_memory().unwrap();
+            let _ = maker
+                .ctx
+                .sqlite_connection
+                .pin(Arc::new(std::sync::Mutex::new(connection)));
+
+            let err = match buy(&maker, true) {
+                Ok(result) => panic!("the buy must fail, got {result}"),
+                Err(e) => e,
+            };
+
+            assert!(err.contains("Error saving an order"), "{err}");
+            assert_eq!(taker_requests(&mut maker), 0, "no taker request is published");
+            assert!(maker.ordermatch_ctx().orderbook_subscriptions.read().is_empty());
+            let stored = block_on(MyOrdersStorage::new(maker.ctx.clone()).load_active_taker_orders()).unwrap();
+            assert!(stored.is_empty(), "{stored:?}");
+            assert!(block_on(maker.ordermatch_ctx().my_taker_orders.lock()).is_empty());
+            block_on(orders_kick_start(&maker.ctx)).unwrap();
+            assert!(block_on(maker.ordermatch_ctx().my_taker_orders.lock()).is_empty());
+        }
+
+        /// Regression: with a save that works (an order kept outside the history; the history row of a successful
+        /// save is covered by `t_b4_1_e_a_successful_save_keeps_the_record_and_the_history_row`), the same `buy`
+        /// subscribes, publishes one taker request and keeps its order and its active record.
+        #[test]
+        fn t_gh8a_h_a_taker_save_that_works_sends_one_request() {
+            let mut maker = Maker::new(json!({}));
+            std::fs::create_dir_all(my_taker_orders_dir(&maker.ctx)).unwrap();
+
+            buy(&maker, false).unwrap();
+
+            assert_eq!(taker_requests(&mut maker), 1);
+            assert_eq!(maker.ordermatch_ctx().orderbook_subscriptions.read().len(), 1);
+            let stored = block_on(MyOrdersStorage::new(maker.ctx.clone()).load_active_taker_orders()).unwrap();
+            assert_eq!(stored.len(), 1);
+            assert_eq!(block_on(maker.ordermatch_ctx().my_taker_orders.lock()).len(), 1);
+        }
+
+        /// T-GH8a bullet 3 with T-GH8 and T-GH9: after a failed re-pricing, the next one whose checks pass
+        /// replaces both orders: one cancel per old order, all before the created message of the new order.
+        #[test]
+        fn t_gh8a_c_the_next_passing_repricing_replaces_both_orders() {
+            let mut maker = Maker::new(json!({ "setprice_replace_after_checks": true }));
+            let previous = maker.two_previous_orders();
+            let root = maker.held_root();
+            fail_the_next_balance_check(&maker);
+            assert!(maker.set_price(true, 3, None).is_err());
+            maker.assert_pair_unchanged(&previous, root);
+
+            let new_order = placed(maker.set_price(true, 3, None));
+
+            assert_eq!(maker.own_orders(), HashSet::from([new_order.uuid]));
+            assert!(maker.in_book(&new_order.uuid));
+            assert!(previous.iter().all(|uuid| !maker.in_book(uuid)));
+            assert_ne!(maker.held_root(), root);
+            let sent = maker.sent();
+            assert_eq!(sent.len(), 3, "{sent:?}");
+            let cancelled: HashSet<Uuid> = sent[..2]
+                .iter()
+                .map(|message| match message {
+                    Sent::Cancelled(uuid) => *uuid,
+                    other => panic!("a cancel message must come first, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(cancelled, previous, "one cancel per old order");
+            assert_eq!(sent[2], Sent::Created(new_order.uuid));
+        }
+
+        /// T-GH8a bullet 4 (R-GH8): with the switch absent or `false`, the failed check cancels both previous
+        /// orders and creates none. A non-boolean value is taken as the default too (bullet 5).
+        #[test]
+        fn t_gh8a_d_at_the_default_a_failed_check_cancels_both_orders() {
+            for extra in [
+                json!({}),
+                json!({ "setprice_replace_after_checks": false }),
+                json!({ "setprice_replace_after_checks": "true" }),
+                json!({ "setprice_replace_after_checks": 1 }),
+                json!({ "setprice_replace_after_checks": null }),
+            ] {
+                let mut maker = Maker::new(extra.clone());
+                let previous = maker.two_previous_orders();
+                fail_the_next_balance_check(&maker);
+
+                assert!(maker.set_price(true, 3, None).is_err(), "{extra}");
+
+                assert_eq!(maker.own_orders(), HashSet::new(), "{extra}");
+                assert!(previous.iter().all(|uuid| !maker.in_book(uuid)), "{extra}");
+                let sent = maker.sent();
+                assert_eq!(sent.len(), 2, "{extra}: {sent:?}");
+                let cancelled: HashSet<Uuid> = sent
+                    .iter()
+                    .map(|message| match message {
+                        Sent::Cancelled(uuid) => *uuid,
+                        other => panic!("{extra}: no created message expected, got {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(cancelled, previous, "{extra}");
+            }
+        }
+
+        /// R-GH8 at the default: a build that fails after the cancel leaves the pair without an order.
+        #[test]
+        fn t_gh8a_d_at_the_default_a_refused_build_leaves_the_pair_empty() {
+            let mut maker = Maker::new(json!({}));
+            let previous = maker.two_previous_orders();
+
+            assert!(maker.set_price(true, 1, Some(2)).is_err());
+
+            assert_eq!(maker.own_orders(), HashSet::new());
+            let sent = maker.sent();
+            assert_eq!(sent.len(), 2, "{sent:?}");
+            assert!(sent.iter().all(|message| match message {
+                Sent::Cancelled(uuid) => previous.contains(uuid),
+                Sent::Created(_) => false,
+            }));
+        }
+
+        /// A request without `cancel_previous` never cancels, with the switch on or off.
+        #[test]
+        fn t_gh8a_without_cancel_previous_nothing_is_cancelled() {
+            for extra in [json!({}), json!({ "setprice_replace_after_checks": true })] {
+                let mut maker = Maker::new(extra.clone());
+                let previous = maker.two_previous_orders();
+                let root = maker.held_root();
+                fail_the_next_balance_check(&maker);
+
+                assert!(maker.set_price(false, 3, None).is_err(), "{extra}");
+
+                maker.assert_pair_unchanged(&previous, root);
+            }
+        }
+
+        /// T-GH8a bullet 5: only a JSON `true` turns the switch on.
+        #[test]
+        fn t_gh8a_e_only_a_json_true_turns_the_switch_on() {
+            let switch = |conf: Json| {
+                let ctx = MmCtxBuilder::new().with_conf(conf).into_mm_arc();
+                setprice_replace_after_checks(&ctx)
+            };
+            assert!(!switch(json!({})));
+            assert!(switch(json!({ "setprice_replace_after_checks": true })));
+            for other in [
+                json!(false),
+                json!("true"),
+                json!(1),
+                json!(0),
+                json!(null),
+                json!([true]),
+            ] {
+                assert!(!switch(json!({ "setprice_replace_after_checks": other })), "{other}");
+            }
+        }
     }
 }
 

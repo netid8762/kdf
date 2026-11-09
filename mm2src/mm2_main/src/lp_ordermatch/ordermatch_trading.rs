@@ -2290,6 +2290,12 @@ pub async fn lp_auto_buy(
     }
     let order = try_s!(order_builder.build());
 
+    // The save comes first (CRD ch.32 R-GH8a): a failed save returns its error with nothing subscribed and no
+    // request sent.
+    save_my_new_taker_order(ctx.clone(), &order)
+        .await
+        .map_err(|e| ERRL!("{}", e))?;
+
     let request_orderbook = false;
     try_s!(
         subscribe_to_orderbook_topic(
@@ -2315,9 +2321,6 @@ pub async fn lp_auto_buy(
         rel_orderbook_ticker: &order.rel_orderbook_ticker,
     } });
 
-    save_my_new_taker_order(ctx.clone(), &order)
-        .await
-        .map_err(|e| ERRL!("{}", e))?;
     my_taker_orders.insert(order.request.uuid, order);
     Ok(result.to_string())
 }
@@ -2507,10 +2510,20 @@ impl<'a> From<&'a MakerOrder> for MakerOrderForRpc<'a> {
     }
 }
 
+/// The top-level MM2.json boolean `setprice_replace_after_checks` (CRD ch.32 R-GH8a item 5), default `false`;
+/// only a JSON `true` turns it on, any other value is the default. On, `setprice` with `cancel_previous` replaces
+/// the previous orders of the pair only after every check and the build of the new order have passed.
+pub(crate) fn setprice_replace_after_checks(ctx: &MmArc) -> bool {
+    ctx.conf["setprice_replace_after_checks"].as_bool() == Some(true)
+}
+
 /// Cancels the orders in case of error on different checks
 /// https://github.com/KomodoPlatform/atomicDEX-API/issues/794
+///
+/// With `setprice_replace_after_checks` on (CRD ch.32 R-GH8a item 3) a failed check cancels nothing: the previous
+/// orders stay and the error is returned.
 pub(crate) async fn cancel_orders_on_error<T, E>(ctx: &MmArc, req: &SetPriceReq, error: E) -> Result<T, E> {
-    if req.cancel_previous {
+    if req.cancel_previous && !setprice_replace_after_checks(ctx) {
         let ordermatch_ctx = OrdermatchContext::from_ctx(ctx).unwrap();
         cancel_previous_maker_orders(ctx, &ordermatch_ctx, &req.base, &req.rel).await;
     }
@@ -2576,8 +2589,27 @@ async fn create_maker_order_impl(ctx: &MmArc, req: SetPriceReq) -> Result<MakerO
     if rel_coin.wallet_only(ctx) {
         return ERR!("Rel coin {} is wallet only", req.rel);
     }
+    // CRD ch.60 R60.6.8: an order with no operator-set minimum volume gets the raised default. The pre-trade check
+    // below then sees that default, capped at the maximum volume where it is already known (`max` false), and a
+    // `max` order is checked again once its volume is computed.
+    let raised_default_term = if req.min_volume.is_none() {
+        try_s!(raised_default_min_volume_term(ctx, &base_coin, &rel_coin, &req.price).await)
+    } else {
+        None
+    };
+    let min_volume_checked = req.min_volume.clone().or_else(|| {
+        raised_default_term.as_ref().and_then(|term| {
+            raised_default_for_check(
+                &base_coin,
+                &rel_coin,
+                &req.price,
+                term,
+                (!req.max).then_some(&req.volume),
+            )
+        })
+    });
     // CRD ch.60 R60.6.7 item 3: the smallest trade the order can produce must be spendable on both legs.
-    try_s!(check_pre_trade_spend_safety(ctx, &base_coin, &rel_coin, req.min_volume.clone(), &req.price).await);
+    try_s!(check_pre_trade_spend_safety(ctx, &base_coin, &rel_coin, min_volume_checked, &req.price).await);
 
     #[cfg(feature = "ibc-routing-for-swaps")]
     {
@@ -2613,9 +2645,21 @@ async fn create_maker_order_impl(ctx: &MmArc, req: SetPriceReq) -> Result<MakerO
         (req.volume.clone(), base_balance)
     };
 
+    // CRD ch.60 R60.6.8 item 3 with R60.6.7: a `max` order's volume is known only now; the default it carries is
+    // the raised one capped at that volume, and that is what must be spendable. Never stricter than the check
+    // above for a plain default, which the capped default is not below.
+    if let (true, Some(term)) = (req.max, raised_default_term.as_ref()) {
+        let capped = raised_default_for_check(&base_coin, &rel_coin, &req.price, term, Some(&volume));
+        try_s!(check_pre_trade_spend_safety(ctx, &base_coin, &rel_coin, capped, &req.price).await);
+    }
+
     let ordermatch_ctx = try_s!(OrdermatchContext::from_ctx(ctx));
 
-    if req.cancel_previous {
+    // CRD ch.32 R-GH8a: with `setprice_replace_after_checks` on, every check above has passed and the order is
+    // built and saved below before the previous orders are cancelled; off (the default), they are cancelled here
+    // (R-GH8).
+    let replace_after_checks = req.cancel_previous && setprice_replace_after_checks(ctx);
+    if req.cancel_previous && !replace_after_checks {
         cancel_previous_maker_orders(ctx, &ordermatch_ctx, &req.base, &req.rel).await;
     }
 
@@ -2628,6 +2672,7 @@ async fn create_maker_order_impl(ctx: &MmArc, req: SetPriceReq) -> Result<MakerO
     let builder = MakerOrderBuilder::new(&base_coin, &rel_coin)
         .with_max_base_vol(volume)
         .with_min_base_vol(req.min_volume)
+        .with_raised_default_term(raised_default_term)
         .with_price(req.price)
         .with_conf_settings(conf_settings)
         .with_save_in_history(req.save_in_history)
@@ -2647,9 +2692,15 @@ async fn create_maker_order_impl(ctx: &MmArc, req: SetPriceReq) -> Result<MakerO
         )
         .await
     );
+    // With `setprice_replace_after_checks` on, the steps that can fail all precede the cancel below: the checks, the
+    // build, the subscription and this save (R-GH8a item 2). After the cancel only the local insert and the
+    // publication remain, and neither returns an error. At the default, the previous orders went before the build.
     save_my_new_maker_order(ctx.clone(), &new_order)
         .await
         .map_err(|e| ERRL!("{}", e))?;
+    if replace_after_checks {
+        cancel_previous_maker_orders(ctx, &ordermatch_ctx, &req.base, &req.rel).await;
+    }
     maker_order_created_p2p_notify(
         ctx.clone(),
         &new_order,

@@ -722,6 +722,91 @@ mod search_for_swap_tx_spend_scripted {
         assert_eq!(expected, found);
     }
 
+    /// The legacy ERC-20 payment validation compares the payment's amount argument with the expected trade amount
+    /// whatever else the payment carries. This swap version has no watcher reward at all, so the amount is the only
+    /// value the payment is checked against: a future change that makes the comparison depend on a reward (or drops
+    /// it) must fail here. The payment is signed by the coin's own key and served by a scripted node, so the check
+    /// runs through the real `validate_payment`; only the contract's payment-state read is mocked.
+    #[test]
+    fn erc20_payment_amount_is_compared_without_a_watcher_reward() {
+        use futures::compat::Future01CompatExt;
+
+        let token_addr = Address::from_slice(&hex::decode("c0eb7aed740e1796992a08962c15661bdeb58003").unwrap());
+        // `EthCoinType` is not `Clone`: each of the two coins gets its own value.
+        let coin_type = || EthCoinType::Erc20 {
+            platform: "ETH".to_string(),
+            token_addr,
+        };
+        let time_lock = 1_700_000_000u32;
+        let secret_hash = vec![7u8; 20];
+        let paid = U256::from(1_000_000_000_000_000_000u64);
+
+        // The node answers the payment's lookup with the transaction as the coin signed it.
+        let (_ctx, signer) = coin("http://unused.test", coin_type());
+        let swap_contract = signer.swap_contract_address;
+        let data = SWAP_CONTRACT
+            .function("erc20Payment")
+            .unwrap()
+            .encode_input(&[
+                Token::FixedBytes(signer.etomic_swap_id(time_lock, &secret_hash)),
+                Token::Uint(paid),
+                Token::Address(token_addr),
+                Token::Address(signer.my_address),
+                Token::FixedBytes(secret_hash.clone()),
+                Token::Uint(U256::from(time_lock)),
+            ])
+            .unwrap();
+        let payment = signer
+            .sign_tx_for_send(UnSignedEthTx {
+                nonce: 1.into(),
+                value: 0.into(),
+                action: Action::Call(swap_contract),
+                data,
+                gas: 200_000.into(),
+                gas_price: 1_000_000_000u64.into(),
+            })
+            .unwrap();
+        let payment_bytes = rlp::encode(&payment).to_vec();
+        let payment_json = rpc_tx(&payment);
+        let payment_hash = format!("{:#x}", payment.tx_hash());
+        let node = spawn(move |method, params| match method {
+            "eth_getTransactionByHash" => {
+                assert_eq!(params[0].as_str().unwrap(), payment_hash);
+                payment_json.clone()
+            },
+            other => panic!("the scripted node does not serve `{}`", other),
+        });
+        let (_ctx, coin) = coin(&node.url, coin_type());
+        EthCoin::payment_status
+            .mock_safe(|_, _, _| MockResult::Return(Box::new(futures01::future::ok(PAYMENT_STATE_SENT.into()))));
+        let key_pair = KeyPair::from_secret_slice(
+            &hex::decode("809465b17d0a4ddb3e4c69e8f23c2cabad868f51f8bed5c765ad1d6516c3306f").unwrap(),
+        )
+        .unwrap();
+        let sender_pub = compressed_secp256k1_public(key_pair.public());
+        let validate = |amount: &str| {
+            block_on(
+                coin.validate_payment(
+                    &payment_bytes,
+                    time_lock,
+                    &sender_pub,
+                    &secret_hash,
+                    amount.parse::<BigDecimal>().unwrap(),
+                    swap_contract,
+                )
+                .compat(),
+            )
+        };
+
+        // The amount the payment carries passes every check of the payment.
+        validate("1").unwrap();
+        // Any other amount, down to one wei either way, is the amount error and nothing else.
+        for wrong in ["2", "0.5", "0.999999999999999999", "1.000000000000000001"] {
+            let err = validate(wrong).unwrap_err();
+            assert!(err.contains("Payment tx value arg"), "amount {wrong}: {err}");
+        }
+    }
+
     /// CRD ch.17 R17.8.1 -- R17.8.3 (T17.8.1 -- T17.8.7): every swap-path `eth_getLogs` is bounded to windows of
     /// at most `W` blocks, `W` shrinks when a node refuses a range, and the wait for a payment's spend moves a
     /// cursor forward and always reaches its deadline. The log-line assertions use one ticker per test, so the
@@ -2898,6 +2983,9 @@ fn trezor_eth_coin_for_test(coin_type: EthCoinType) -> (MmArc, EthCoin) {
             derivation_path,
             address,
             public,
+            hw_ctx: crate::utxo::utxo_tests::hd_accounts_at_index_tests::device_context(
+                crate::utxo::utxo_tests::hd_accounts_at_index_tests::DEVICE_PUBKEY,
+            ),
         }),
         swap_contract_address: Address::from_slice(&hex::decode("7Bc1bBDD6A0a722fC9bffC49c921B685ECB84b94").unwrap()),
         fallback_swap_contract: None,
@@ -2947,6 +3035,9 @@ fn a_trezor_signed_hd_coin_is_not_a_software_hd_wallet() {
         derivation_path: DerivationPath::from_str("m/44'/60'/0'/0/0").unwrap(),
         address,
         public: *key_pair.public(),
+        hw_ctx: crate::utxo::utxo_tests::hd_accounts_at_index_tests::device_context(
+            crate::utxo::utxo_tests::hd_accounts_at_index_tests::DEVICE_PUBKEY,
+        ),
     });
     let hardware = EthCoin(Arc::new(inner));
 
@@ -2954,6 +3045,39 @@ fn a_trezor_signed_hd_coin_is_not_a_software_hd_wallet() {
     assert!(hardware.uses_hardware_signer());
     assert!(hardware.hardware_derivation_path().is_some());
     assert!(!hardware.uses_software_hd_wallet());
+}
+
+/// CRD ch.05 R58a, T36: the account extended public key of an EVM coin of the Trezor policy is read from the
+/// device it was activated with. A hardware context of another device is refused with `FoundUnexpectedDevice`
+/// before the extractor is asked; the device of the activation is asked.
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
+#[test]
+fn r58a_t36_evm_xpub_read_refuses_a_replaced_device() {
+    use crate::hd_pubkey::{ExtractExtendedPubkey, HDExtractPubkeyError};
+    use crate::utxo::utxo_tests::hd_accounts_at_index_tests::{device_context, CountingDevice, DEVICE_PUBKEY,
+                                                              DEVICE_PUBKEY_B};
+
+    let (_ctx, coin) = trezor_eth_coin_for_test(EthCoinType::Eth);
+    let path = || DerivationPath::from_str("m/44'/60'/0'").unwrap();
+
+    let device_b = CountingDevice::with_context(device_context(DEVICE_PUBKEY_B));
+    let error = block_on(coin.extract_extended_pubkey(Some(&device_b), path()))
+        .err()
+        .expect("the replaced device must be refused")
+        .into_inner();
+    assert!(matches!(
+        error,
+        HDExtractPubkeyError::HardwareWalletError(crypto::HwError::FoundUnexpectedDevice { .. })
+    ));
+    assert_eq!(device_b.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    // The device of the activation passes the check and reaches the extractor, which has no EVM device here.
+    let device_a = CountingDevice::with_context(device_context(DEVICE_PUBKEY));
+    let error = block_on(coin.extract_extended_pubkey(Some(&device_a), path()))
+        .err()
+        .expect("the test extractor answers no key")
+        .into_inner();
+    assert!(matches!(error, HDExtractPubkeyError::CoinDoesntSupportTrezor));
 }
 
 /// R50.24 / R49.6: the direct legacy `withdraw` method rejects a Trezor-policy
