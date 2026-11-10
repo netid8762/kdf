@@ -193,6 +193,20 @@ The developer-facing rule (mandatory for AI assistants, strong recommendation fo
   logs no such line. What `disable_cert_verification` accepts and refuses is
   the same on both. See CRD ch.38 R38.6.4m and R38.6.4n and
   [`docs/GLEEC_COMPATIBILITY.md`](docs/GLEEC_COMPATIBILITY.md).
+- **A coin's Electrum servers that are behind the chain or stuck are asked last, and a swap's
+  confirmation wait polls one server.** Reloaded asks each connected Electrum server for its newest
+  block when it joins and compares the heights: a server more than the coin's tolerance (180 seconds
+  of blocks, at least 1 and at most 20) behind the height two or more servers have reached, or one
+  that sends no new block for three block times or ten minutes while another does, is tried after
+  the others for reads and broadcasts, and logged once per change of state; a confirmation wait
+  polls one up-to-date server for the whole wait and moves on only when it fails. The read-only
+  request `electrum_servers` shows the servers' state. GLEEC KDF ranks by the list position and has
+  none of this, so a lagging server keeps answering there. No peer observes it. To get GLEEC KDF's
+  routing, set `electrum_tip_checks` to `false` (see the settings list below). Servers that disagree
+  about the chain (one far ahead of the rest, or two with different headers at a common height) fail
+  the activation with an error naming them, and after activation the coin refuses new orders and
+  withdrawals with that error, and starts no new swap, until they agree again; GLEEC KDF has no such
+  check. Row in [`docs/GLEEC_COMPATIBILITY.md`](docs/GLEEC_COMPATIBILITY.md); CRD ch.38 R38.6.4o.
 - **Bitcoin II (BC2) transactions are signed the way the BC2 network requires.**
   Since block 57,750 the BC2 network checks every signature against a digest
   that carries an extra 4-byte field after the signature-hash type, and refuses
@@ -500,16 +514,18 @@ These are divergences from GLEEC KDF that no compatibility switch reverses in th
   §62.7). KDF Reloaded asks two sources at the same time (`prices.gleec.com` with its cache
   `defistats.gleec.com`, and `prices.cipig.net:1717`, with `?expire_at=259200`) and combines them: a coin
   priced by one source is kept, a coin both price within 5 % takes the newer record, and a coin they
-  disagree on by more than that is not priced at all -- the bot quotes no pair with it and a swap with it is
-  stored without USD prices (on 2026-11-07 the two services priced KMD at 0.00313 and 0.00680 USD). There is
+  disagree on by more than that is, by default, priced from the first source with a warning (on 2026-11-07 the
+  two services priced KMD at 0.00313 and 0.00680 USD, and a wrong figure from the first source can be used this
+  way). The `MM2.json` key `price_conflict` set to `"refuse"` leaves such a coin unpriced instead: the bot quotes
+  no pair with it and a swap with it is stored without USD prices. There is
   no rotation, since the first address of a source is asked first every time. A failing price address is
   reported by one warning when it starts failing and one info line when it answers again (the bot finding
   no source at all, by one error line), each attempt on a native build is cut off after 10 s (a browser build
   also sets a timer, which no test covers yet), and the USD prices of an own swap are fetched once, only for a successful swap (as in GLEEC
   KDF; earlier KDF Reloaded builds fetched them for every swap, from an address that no longer resolves). The bot's
   per-pair refusal and immediate cancellation of orders are the reference's; they are under observation in
-  v0.4.0 and will be revisited. The `MM2.json` keys `price_urls` and `price_providers` are new; GLEEC KDF
-  has neither key nor a configurable provider set. The start request now accepts the reference's `price_urls`
+  v0.4.0 and will be revisited. The `MM2.json` keys `price_urls`, `price_providers` and `price_conflict` are new; GLEEC KDF
+  has none of them and no configurable provider set. The start request now accepts the reference's `price_urls`
   too. See CRD ch.62,
   [`docs/NETWORK_CONFIG.md`](docs/NETWORK_CONFIG.md#price-service) and
   [`docs/GLEEC_COMPATIBILITY.md`](docs/GLEEC_COMPATIBILITY.md).
@@ -551,6 +567,20 @@ These are divergences from GLEEC KDF that no compatibility switch reverses in th
   transport level is suspended for 20 s, doubling up to 12 hours, and endpoints that are not
   suspended are tried first. Only the order in which the operator's own endpoints are asked, and
   error texts, change. Row in [`docs/GLEEC_COMPATIBILITY.md`](docs/GLEEC_COMPATIBILITY.md); CRD ch.39 R39.11.30, R39.11.31.
+- **A Tendermint coin can carry priority gas prices, and a request or a swap fee policy can pick one.**
+  Reloaded reads the optional `priority_gas_prices` member (three numbers, the chain's low, average and high gas
+  prices) of a `TENDERMINT` entry's `protocol_data`, accepts the `CosmosGasPriority` fee form beside the
+  `CosmosGas` one on withdraw and staking requests, and lets `get_swap_gas_fee_policy` and
+  `set_swap_gas_fee_policy` take a Tendermint platform coin; GLEEC KDF `v3.0.0-beta` has none of the three beyond
+  `CosmosGas`, and answers `NotSupported` for a Tendermint coin on the two methods. Two points are Reloaded's own:
+  an array with a figure of zero or less fails the coin's activation, where a zero price would make every fee zero;
+  and `set_swap_gas_fee_policy` on a Tendermint coin without `priority_gas_prices` accepts and stores any value
+  with one warning in the log that the coin cannot honor the level, and prices at the default. A Tendermint request
+  that carries a fee form of another family ignores it, as GLEEC KDF does. No switch is needed: a coins file
+  without the member and a request without the new forms are priced as before; only the staking default gas
+  limits change (CHANGELOG, Changed). Rows in
+  [`docs/GLEEC_COMPATIBILITY.md`](docs/GLEEC_COMPATIBILITY.md); CRD ch.36 R36.3.5, ch.18 R18.6B, ch.49 R49.28 to
+  R49.30, ch.35 R35.6.8, R35.6.9. PR #323.
 
 ### Removed / disabled in KDF Reloaded
 
@@ -755,6 +785,12 @@ behavior, except for `swap_key_check`; the row of each switch in
   servers when two or more are connected), then have no effect.
 - `electrum_server_order: "listed"` — a coin's Electrum servers are ranked in the order they are
   listed instead of by a random draw.
+- `electrum_tip_checks: false` — the node does not compare the block heights of a coin's Electrum
+  servers, does not fail an activation or refuse trades when they disagree about the chain: a server
+  that is behind the chain or stopped following it keeps its place in reads, broadcasts and a swap's
+  confirmation wait, which polls the first connected server in priority order. Together with the two
+  switches above this gives GLEEC KDF's routing. The `electrum_servers` request has no GLEEC KDF
+  equivalent.
 - `orderbook_sync_names_held_root: false` — a sync request names the root the maker advertised
   instead of the one this node holds.
 - `order_messages_refresh_liveness: false` — only keep-alives keep a maker's order book alive.

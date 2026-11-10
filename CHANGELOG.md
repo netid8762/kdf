@@ -85,6 +85,34 @@ A login without `enable_hd` is not affected. Detail: PR #319; CRD ch.36 R36.1.2,
   limits a chain needs is now visible at once, as it was not when Monad token swaps ran out of gas
   with a coins file older than October 28, 2026. Detail: PR #200; CRD ch.57 R57.5.5.
 
+#### Tendermint (Cosmos) coins
+
+- **A Tendermint coin can carry the chain's three published gas prices, and a request can pick one by
+  name.** The coin's `protocol_data` in the coins file may now hold `priority_gas_prices`, an array of
+  exactly three numbers: the low, average and high gas prices of the chain, in the base denom per gas
+  unit (the chain registry publishes them). A withdraw, a delegation, an undelegation or a reward claim
+  that names `Low`, `Average` or `High` is priced with the matching figure; `Default`, and any name on a
+  coin without the array, keep the coin's usual `gas_price`. The array is optional, the figures may be in
+  any order, and a token is priced with its platform coin's array. A coin without the member is priced
+  exactly as before. Detail: PR #323; CRD ch.36 R36.3.5, ch.18 R18.6B.1.
+- **A Tendermint request can set the gas limit and the gas price, or the price level.** The `fee`
+  member of `withdraw`, `task::withdraw::init` and the staking requests now takes two more forms for a
+  Tendermint coin or token: `{"type": "CosmosGas", "gas_limit": 125000, "gas_price": 0.03}` and
+  `{"type": "CosmosGasPriority", "gas_limit": 125000, "gas_price_option": "High"}` (`Low`, `Average`,
+  `High` or `Default`, spelled exactly so). The gas limit is the one the transaction is signed with. The
+  fee amount is still derived from the node's gas simulation, `ceil(gas used x 1.5 x price)`, not from
+  the limit times the price. UTXO, EVM, QRC20 and Siacoin coins refuse the two forms with
+  `InvalidFeePolicy` (a shielded coin refuses any `fee`, as before), and a Tendermint request that
+  carries a form of another family ignores it and uses the default price and gas limit. Detail: PR #323; CRD ch.49 R49.28 to R49.30, ch.18 R18.6B.2.
+- **`get_swap_gas_fee_policy` and `set_swap_gas_fee_policy` now accept a Tendermint platform
+  coin.** The policy (`Legacy`, `Low`, `Medium`, `High`, starting at `Legacy`) selects the gas price of
+  the coin's swap transactions and of its trade-fee estimates: `Low`, `Medium` and `High` pick the low,
+  average and high figure of `priority_gas_prices`, `Legacy` the default price. It never changes a
+  withdraw or a staking transaction. A Tendermint token has no policy of its own and
+  the two methods answer `NotSupported` for its ticker. On a coin without `priority_gas_prices` the
+  methods still accept and store any value, with one warning in the log that the coin cannot honor the
+  level, and prices stay at the default. Detail: PR #323; CRD ch.35 R35.6.8, R35.6.9.
+
 #### Order book and peer-to-peer network
 
 - **How close a connection comes to being closed as stuck can now be watched.** A node closes a
@@ -130,6 +158,17 @@ A login without `enable_hd` is not affected. Detail: PR #319; CRD ch.36 R36.1.2,
 
 #### UTXO coins and Electrum
 
+- **A new request, `electrum_servers`, shows which Electrum server a coin uses and how far behind
+  each one is.** Send `{"mmrpc": "2.0", "method": "electrum_servers", "params": {"coin": "RIN"}}`
+  for an active coin that uses Electrum servers. The answer lists every server of the coin in the
+  order the node ranks them, by host and port: whether it is connected, whether reads are being sent
+  to it, its latest block height, how many blocks it is behind the other servers, whether it is out
+  of date (`behind`, `ahead` or `stuck`), its smoothed round trip, whether it is suspended or marked
+  as poor, and whether it was removed from the coin's list. It also gives the coin's tolerance in
+  blocks and the block height most servers agree on. The request only reads what the node already
+  knows and sends nothing to any server. A coin that is not active answers `NoSuchCoin`; a coin that
+  does not use an Electrum client (a coin with a local daemon, a shielded coin, a token of another
+  family) answers `CoinIsNotElectrum`. Detail: PR #324; CRD ch.38 R38.6.4o.
 - **Radiant (RXD) swaps between two KDF Reloaded nodes are tested on the mainnet.** On 2026-11-09, RXD against
   RIN completed in both directions (RXD as the maker's coin and as the taker's coin), and a refund of an RXD
   payment went out for the maker and for the taker after the lock time. The first swap took 930 seconds, of which
@@ -391,6 +430,52 @@ A login without `enable_hd` is not affected. Detail: PR #319; CRD ch.36 R36.1.2,
 
 #### UTXO coins and Electrum
 
+- **A coin whose Electrum servers disagree about the chain now fails to activate, and later refuses
+  new trades.** A server that is far ahead of the rest is not simply wrong: it can be the one that
+  followed a network upgrade while the others stopped. The node cannot tell which side is right, so
+  it stops instead of choosing. A server counts as far ahead when, with three or more servers, it is
+  more than the coin's tolerance (three minutes of blocks) above the height the others reach. Two
+  servers that answer different block headers for the same height, compared at a height below the
+  tip, also count. When the node activates a coin it waits up to 5 seconds after its first
+  connection for the other servers' heights and the comparison, then fails the activation with an
+  error that names every server with a height, and the coin is not registered. The legacy `electrum`
+  and `enable` calls and the task activations report that text. After activation, when the servers
+  come to disagree, the node logs one error line, and the coin refuses a new order with it as base
+  or rel and a withdrawal with the same text, and does not start a new swap (the error line says
+  why), until the servers agree again; balance and other reads and swaps that have started go on. To
+  fix it, remove the servers that follow the other chain from the coin's list or activate the coin
+  with servers that agree. With two servers the node compares the block headers at a common height
+  when they are far apart: the same header means the lower server is only behind (the higher one is
+  used), a different header is a disagreement. A coin activated with fewer than three servers logs
+  one warning, because with fewer the node cannot always tell a stale server from one on another
+  chain. `electrum_tip_checks` set to `false` turns all of this off. The `electrum_servers` answer
+  has a new field `chain_disagreement`. Detail: PR #324; CRD ch.38 R38.6.4o items 12–13.
+- **A coin's Electrum servers that are behind the chain, or stopped following it, are no longer
+  asked.** A server that is 1,000 blocks behind used to keep its share of balance and history reads,
+  and a swap's wait for a confirmation could be answered by any server in turn. Now the node asks
+  every connected server for its newest block when it joins the coin's set, under every
+  `electrum_server_order`, and compares them. A server is *behind* when it is more than the coin's
+  tolerance below the height two or more servers have reached (with two servers, below the higher
+  one). The tolerance is three minutes of blocks, at least 1 and at most 20: 1 for BTC, 2 for LTC, 3
+  for RIN and KMD, 12 for DGB. A server far above that height is not hidden: see the entry on
+  disagreement about the chain. A server is *stuck* when it sends no new block for longer than three
+  block times or ten minutes while another server does. Such a server stays in the set and keeps
+  answering when the others fail, but reads, transaction broadcasts and confirmation waits go to the
+  others first, and it is asked again as soon as it has caught up. The node logs one warning, naming
+  the server by host and port, when a server falls behind or is stuck, and when it is up to date
+  again. A swap's confirmation wait now asks one server for the whole wait (the first connected one
+  that is up to date) and moves to another only when that one fails, so the weakest of several
+  servers can no longer end it early. A single server that claims a height far above the others, or
+  a server of another network in the list, no longer makes the honest servers look behind. With
+  `electrum_server_order` set to `mixed` or `measured`, the same tolerance decides which measured
+  servers count as fresh, and repeated searches for a replacement wait 5, 10, 20, 40 and then 60
+  minutes, so a halted chain does not make every node probe the public servers every five minutes,
+  and a search for a replacement connects at most four servers at a time. For the old behavior, set
+  the `MM2.json` boolean `electrum_tip_checks` to `false` (and `electrum_server_order` to `listed`
+  and `electrum_spread_reads` to `false` to match GLEEC KDF). **`mixed` does not become the default
+  yet.** The change is in two stages: this release brings the checks; the default order changes from
+  `random` to `mixed` in a later release, after a field run on RIN, DGB and a coin with 600-second
+  blocks has shown no false marks. Detail: PR #324; CRD ch.38 R38.6.4o.
 - **`fetch_utxos`, `consolidate_utxos` and the automatic merge (`utxo_merge_params`) now work
   under an HD login**, as they do in GLEEC KDF. Until now the two commands were refused and the
   automatic merge stayed off.
@@ -637,6 +722,29 @@ A login without `enable_hd` is not affected. Detail: PR #319; CRD ch.36 R36.1.2,
 
   One change applies today: a coin entry with `avg_blocktime` 0 now fails activation with an error
   naming the key. Detail: PR #299; CRD ch.18 §18.11.
+- **A Tendermint coin whose configured gas prices include a figure of zero or less now fails
+  activation.** A `priority_gas_prices` array with a figure that is zero, negative or not a finite
+  number makes the coin's fee zero or undefined, so activation is refused with a
+  `PlatformCoinCreationError` that names the member, and nothing is registered. A malformed array (not
+  exactly three numbers) fails with `CoinProtocolParseError`. Detail: PR #323; CRD ch.36 R36.3.5 (note),
+  T36.17.
+- **Delegations, undelegations and reward claims on a Tendermint coin are signed with a larger default
+  gas limit.** They used the 125,000 of a plain transfer. The defaults are now 187,500 for a delegation
+  and a reward claim and 250,000 for an undelegation; a request can still set its own limit with the
+  new `fee` forms. The fee amount comes from the node's gas simulation and does not change. Detail: PR
+  #323; CRD ch.18 R18.6B.3.
+
+#### Price service and the maker bot
+
+- **A coin on which the price sources disagree is now priced from the first source, with a warning, instead of
+  being left unpriced.** The 5 % check between the two sources no longer leaves a coin unpriced just because the
+  two services take its price from different providers and the figures differ. If one price provider's figures
+  from two sources agree, the newest of them is used. Otherwise the coin is priced from the first source, in the
+  order of `price_urls`, and the log carries one warning that names the coin, both figures, both providers and the
+  host used. The bot and the swap prices both follow it. **With this default a wrong figure from the first source
+  can be used, with a warning.** `"price_conflict": "refuse"` in `MM2.json` restores the old behavior: such a
+  coin is not priced. A value of another form is ignored with one warning that names the key. See
+  [Network configuration](docs/NETWORK_CONFIG.md#price-service). Detail: PR #326; CRD ch.62 D62.2.
 
 ### Fixed
 
@@ -823,6 +931,38 @@ A login without `enable_hd` is not affected. Detail: PR #319; CRD ch.36 R36.1.2,
 
 #### UTXO coins and Electrum
 
+- **A coin with several Electrum servers no longer fails to activate when one server never answers
+  and another is refused.** A field report: the legacy `electrum` call for UNO, with
+  `electrum_server_order` set to `mixed`, three servers and `max_connected` 2, answered "The balance
+  was not received within 20 seconds" in 3 of 16 lab runs, and 0 of 16 with `random`. One server
+  never accepted a connection, one was refused at once (its certificate had expired) and one was
+  good. Three things went wrong together, and each is fixed:
+  - Under `mixed` and `measured` the node offered a connection to the coin's set of connected
+    servers only after its first block-height answer, so the activation returned with an empty set
+    and the balance read had to try every server. Now every connection is offered as it is made, as
+    under `random`, and the block-height answer still ranks the servers afterwards.
+  - When the set is empty or every connected server fails, the node tried the remaining servers in
+    fixed pairs (`max_connected` at a time), and a pair of the silent and the refused server waited
+    for the silent one, so the pair with the good server was not reached in time. Now the next
+    server starts as soon as one attempt fails, and each attempt's time is worked out from the
+    servers still to try.
+  - The 20 seconds of the `electrum` and `enable` balance read were not known to the Electrum
+    client, which budgeted its attempts against 60 seconds. Now the read passes its 20 seconds on,
+    so the client moves to the next server inside it.
+  A server that has answered nothing yet no longer takes its turn of the reads while another has
+  answered: before, a server that was connected but silent took its share of the reads and each of
+  them waited for the failover. The answer to the block-height request a server gets when it joins
+  now counts as its first measured round trip. Detail: PR #324; CRD ch.38 R38.6.4a, R38.6.4f,
+  R38.6.4j, R38.6.4k-R.
+- **A coin whose Electrum servers keep failing no longer fills the log with two errors every 10
+  seconds.** With `tx_history` on, the history loop logged the failed balance read and the failed
+  history request on every attempt, for as long as the server failed, for example on an expired
+  certificate (a field report). It now logs each error once, also when its text carries a changing
+  number such as a time, then one summary line per 10 minutes with the count, and one line when the
+  server answers again. While the history request keeps failing, the attempts after the first retry
+  wait 60 s and then longer, up to 5 minutes, instead of 10 s each, so after the server recovers,
+  the history can resume up to 5 minutes later. A healthy coin is unaffected. Detail: PR #327; CRD ch.38 §38.6.5
+  item 8.
 - **Under an HD login, a coin's account keys and its stored accounts follow the coin's own key
   policy, also when a Trezor is initialized.** A node logged in with a seed phrase accepts
   `task::init_trezor` afterwards, as GLEEC KDF does. Until now:
@@ -887,8 +1027,8 @@ A login without `enable_hd` is not affected. Detail: PR #319; CRD ch.36 R36.1.2,
   another service, and no swap completed stored USD prices. The default is now two sources asked at the
   same time: the GLEEC price service (and, if it does not answer, its cache) and the prices.cipig.net price
   service, each with `?expire_at=259200` so that no price older than 72 hours is served. A coin that only one
-  source prices is priced from it. A coin both price must agree within 5 %; if they do not, the coin gets no
-  price from either, and the bot quotes no pair with it. A source that does not answer is skipped. The bot
+  source prices is priced from it. The prices of a coin both services price should agree within 5 %; for one
+  that does not, see the `price_conflict` entry under Changed. A source that does not answer is skipped. The bot
   and the swap prices use the same sources. Two new top-level keys in `MM2.json` change them: `price_urls`
   (an array of sources, each one address or an array of addresses tried in order) replaces the default
   sources, and `price_providers` (an array of names) replaces the price providers the node recognizes
