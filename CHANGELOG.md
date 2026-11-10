@@ -640,6 +640,12 @@ A login without `enable_hd` is not affected. Detail: PR #319; CRD ch.36 R36.1.2,
 
 #### Transport, TLS and dependencies
 
+- **One new RustSec advisory is accepted in `deny.toml` until the SQLite library is updated.**
+  RUSTSEC-2026-0459 concerns the bundled SQLite (before 3.54.0) returning uninitialized memory when
+  a database is opened together with a `-wal` file written by a less trusted party. The node opens
+  only database files it creates itself in its own data directory, so the condition is outside its
+  model. The fix is a `rusqlite` update, which waits for the shielded-coin wallet library to move
+  to that version. The node itself is unchanged. Detail: PR #332.
 - **The old DNS libraries are gone from the build.** The peer-to-peer transport no longer uses
   its own DNS layer, so that layer and the unmaintained resolver library it pulled in
   (trust-dns 0.22, with an accepted `idna` advisory) are no longer built. The dependency policy
@@ -650,8 +656,14 @@ A login without `enable_hd` is not affected. Detail: PR #319; CRD ch.36 R36.1.2,
 - **Siacoin (SC) swaps are supported.** Atomic swaps of SC were verified on the live chain on
   November 4, 2026: between two KDF Reloaded nodes in both directions, including a refund, and
   with Komodo KDF and GLEEC KDF nodes in the cases that Known limitations does not exclude. Earlier
-  releases said SC swaps were postponed; that statement is withdrawn. Detail: PR #239; CRD ch.20
-  D5, R-S11.
+  releases said SC swaps were postponed; that statement is withdrawn. On November 10, 2026 three
+  more cases passed between two KDF Reloaded nodes: a maker that sells SC refunds its payment by
+  itself when the taker stops (the refund gate compares the lock with the Sia node's median block
+  time, so the refund was broadcast about an hour and a half after the lock, and it was mined in the
+  next block); a node restarted after such a stop
+  refunds by itself at start; and an SC/RIN swap in both directions on netid 6133, with that
+  network's 2 % fee. Detail: PR #239; CRD ch.20 D5, R-S11; release tests, "Siacoin refund,
+  recovery and netid 6133".
 
 #### Withdrawals
 
@@ -683,6 +695,10 @@ A login without `enable_hd` is not affected. Detail: PR #319; CRD ch.36 R36.1.2,
 
 #### RPC interface
 
+- **The test helper `sim_panic` is no longer part of release builds.** This legacy method made
+  the node panic on request; it is now compiled only with the Cargo feature `sim-panic-rpc`, which
+  no published build enables. A request for the name answers `NoSuchMethod` like any unknown
+  method. Detail: PR #331; CRD ch.43 R43.4.1 status note.
 - **A request without `mmrpc` whose method only the mmrpc 2.0 interface knows is now answered
   through that interface, as on GLEEC KDF.** When the legacy method table has no entry for the
   request's method, the node retries the request once as an mmrpc 2.0 request and answers in the
@@ -733,6 +749,19 @@ A login without `enable_hd` is not affected. Detail: PR #319; CRD ch.36 R36.1.2,
   and a reward claim and 250,000 for an undelegation; a request can still set its own limit with the
   new `fee` forms. The fee amount comes from the node's gas simulation and does not change. Detail: PR
   #323; CRD ch.18 R18.6B.3.
+
+#### TRON coins
+
+- **TRON coins show their balance, their own address and can broadcast a signed transaction through
+  the usual wallet calls.** The balance of TRX and of TRC20 tokens is read from the TRON node; an
+  account the chain has not seen yet shows a zero balance, and a node error is reported as an error,
+  never as zero. The coin's address is shown in the TRON form that starts with `T`, and
+  `validateaddress` accepts the same forms as a TRON withdrawal. A raw transaction is sent to the
+  TRON node instead of an EVM node. A TRON withdrawal that names a `fee` is refused with
+  `InvalidFeePolicy` instead of ignoring it, since TRON works out its own fee. Two defects that kept
+  every TRON withdrawal from reaching the network are fixed: the current block is read in the form
+  the node sends, and a TRX transfer now carries its contract type. There is no user effect while
+  TRON is switched off in this build. Detail: PR #333; CRD ch.21 §21.10A.
 
 #### Price service and the maker bot
 
@@ -851,6 +880,12 @@ A login without `enable_hd` is not affected. Detail: PR #319; CRD ch.36 R36.1.2,
 
 #### Order book and peer-to-peer network
 
+- **A connection closed for a stuck gossip queue is no longer dialed again early.** A node closes
+  every connection to a peer whose gossip send queue stays stuck. Such a close counts as this node's
+  own close, so the address waits the full 5-minute redial guard. Earlier builds told that close apart
+  only when it ended cleanly; one that ended with a transport error looked like a cut and could be
+  dialed again within about 30 s. The gossip layer now marks the connections it closes as stuck, and
+  the redial guard reads the mark. Detail: PR #328; CRD ch.28 R27a item 1a.
 - **The mmrpc 2.0 `orderbook` names its internal failure `Internal`, as on GLEEC KDF.** It answered
   `InternalError`; HTTP 500 and the message are unchanged. *Upgrade note:* a client that checks
   `error_type` for `InternalError` on `orderbook` must check `Internal` instead. Detail: PR #312; CRD
@@ -1048,6 +1083,11 @@ A login without `enable_hd` is not affected. Detail: PR #319; CRD ch.36 R36.1.2,
 
 ### Tests
 
+- **The log-capture test helper answers the same to tests that start at the same moment.** About
+  thirty `coins` tests capture the log to check that no credential leaks and skip that check when
+  another logger owns the process. Two such tests starting together could make the second one skip
+  although the capture was in place. The helper now decides once per process, and a test checks
+  eight concurrent callers get one answer. The node itself is unchanged. Detail: PR #329.
 - **A lab row checks what a short network outage does to a relay connection.** With every packet
   between a relay and a peer dropped and no socket reset, a 10-second outage kept the connection and
   traffic resumed within 6 seconds, three times out of three. After a 30-second outage the
@@ -1118,6 +1158,11 @@ A login without `enable_hd` is not affected. Detail: PR #319; CRD ch.36 R36.1.2,
 
 ### Documentation
 
+- **The RPC method census notes two names that only KDF Reloaded routes on the legacy
+  surface.** `peer_connection_healthcheck` answers on both envelopes here, and the test helper
+  `sim_panic` on the legacy one; the census tables and totals, which count the reference, are
+  unchanged. Two source comments on the Cosmos withdraw-fee forms now say exactly how each other coin
+  family treats them. Detail: PR #330.
 - **The published signing key carries the release signing subkey.** The key file in
   `docs/keys/takologi.asc` now includes the ed25519 subkey that signs tags and releases, and
   `SECURITY.md` names that subkey, gives the keyserver explicitly, notes that the key file in tags up
@@ -1140,6 +1185,10 @@ A login without `enable_hd` is not affected. Detail: PR #319; CRD ch.36 R36.1.2,
   and how the gossip layer treats a peer that reads slowly. The node itself is unchanged. Detail:
   CRD PR #267; CRD ch.05 R35a–R35c, ch.09 R24, ch.21 §21.4, ch.28 RQ1b, ch.32 R-Q6b, ch.38
   R38.6.4m, ch.39 R39.5A.3, ch.49 R49.27b.
+
+- **The design notes record that no released GLEEC KDF build has TRON swaps**, and describe the
+  public TRON swap contract, its testnet deployment and the state a TRON swap reads, as the basis for
+  the TRON swap work. The node itself is unchanged. Detail: PR #333; CRD ch.21 §21.11B.
 
 ### Plans touched
 
@@ -1277,7 +1326,9 @@ file carries the detail. "New" means the plan was created in this cycle.
   reference value; its work is planned.
 - [`tron-gasfree`](docs/plans/tron-gasfree.md) — parked: TRON support was added to the 0.4.0 scope on 2026-11-08.
 - [`tron-support`](docs/plans/tron-support.md) — in progress: TRON support was added to the 0.4.0 scope on 2026-11-08; the
-  decisions a TRON swap needs were put to the maintainer that day.
+  decisions a TRON swap needs were put to the maintainer that day. The activation route was decided
+  on 2026-11-08 (work package 1), the wallet path's balance, address and broadcast are wired (work
+  package 4), and TRON stays switched off in this beta (decided 2026-11-10).
 - [`tron-swap-support`](docs/plans/tron-swap-support.md) — parked: the chapter rewrite on its branch failed the KDF Dirty
   Gate on 2026-11-08 and is not reused; the reference's TRON swap state is recorded by a gated Spec
   Reader round that lands with the first TRON code PR.
@@ -1290,6 +1341,55 @@ file carries the detail. "New" means the plan was created in this cycle.
   closed by PR #219.
 - [`withdraw-entry-expiry-by-block-time`](docs/plans/withdraw-entry-expiry-by-block-time.md) — planning: it records that 0.3.0-beta.1 fixed
   the earlier problem (PR #181); the two ideas left are not in 0.4.0.
+
+### Not in this release
+
+Work that was planned or started for this cycle but is postponed to a later version. Each item says
+why and where the plan lives; what a user meets today is under Known limitations below.
+
+- **TRON (TRX, TRC20) activation and swaps.** TRON support is not finished, so TRON activation
+  stays off in this beta (see Known limitations), and TRON swaps are not built yet. More in
+  [`tron-support`](docs/plans/tron-support.md).
+- **TRON GasFree (gasless TRC20 withdrawals).** It is specified (CRD ch.63) but not in this build:
+  an earlier implementation stays parked on a branch and is not revived, and the new work needs
+  TRON activation and a pinned GasFree proxy creation bytecode first. More in
+  [`tron-gasfree`](docs/plans/tron-gasfree.md).
+- **Tendermint (Cosmos) orders and swaps.** Tendermint coins stay wallet-only; orders and swaps
+  return only with a swap plan of their own and its tests, which do not exist yet. The activation
+  features not built yet are in
+  [`tendermint-activation-features`](docs/plans/tendermint-activation-features.md).
+- **Solana (SOL, SPL).** Activation stays off: the support is not finished, and the Solana SDK the
+  build uses is pinned to a version that could only be upgraded through a fork. More in
+  [`solana-support`](docs/plans/solana-support.md) and
+  [`solana-sdk-upgrade`](docs/plans/solana-sdk-upgrade.md).
+- **Siacoin (SC): V2 swaps, a watcher's spend of a maker payment, and a rate-based swap fee.** SC
+  swaps use the V1 swap protocol; the V2 path is a draft only. A watcher cannot spend an SC maker
+  payment for its owner, a gap no coin has closed yet. Every SC swap transaction pays the fixed
+  miner fee of 0.00002 SC; a fee computed from the network's fee rate is postponed, and is needed
+  only if transactions stop being mined at the fixed fee. No plan yet. Detail: CRD ch.20 D5 and D7,
+  ch.54.
+- **The swap watcher.** No swap hands its data to a watcher yet (see Known limitations). A watcher
+  framework is planned for the next version; its plan is not written yet.
+- **mmrpc 2.0 forms of the legacy-only methods.** Methods such as `setprice`, `cancel_order` and
+  `my_orders` answer only legacy requests, as in GLEEC KDF. Versioned forms of them are a candidate
+  for the next version. More in [`mmrpc-v2-completion`](docs/plans/mmrpc-v2-completion.md).
+- **ARRR (Pirate) native mode, the Ironwood pool and Pirate1 receiving addresses.** This release
+  receives Ironwood deposits that carry a Sapling output and pays Pirate1 addresses. Native mode (a
+  shielded coin served by its own full node) is refused, and the wallet does not yet hold, scan or
+  spend notes in the Ironwood pool or hand out a Pirate1 receiving address. More in
+  [`arrr-native-and-ironwood-pool`](docs/plans/arrr-native-and-ironwood-pool.md). Finding a swap's
+  transactions by walking the light-wallet server's blocks also follows after this beta: more in
+  [`arrr-htlc-lightwalletd-txwalk`](docs/plans/arrr-htlc-lightwalletd-txwalk.md).
+- **Lightning orders and swaps.** Lightning coins cannot trade, and the work on their activation
+  features and on the LDK library upgrade is parked. More in
+  [`lightning-activation-features`](docs/plans/lightning-activation-features.md) and
+  [`lightning-ldk-upgrade`](docs/plans/lightning-ldk-upgrade.md).
+- **QTUM and QRC20 stabilization.** It is analyzed and planned, but not started. More in
+  [`qtum-qrc20-stabilization`](docs/plans/qtum-qrc20-stabilization.md).
+- **A typed error for the Radiant (RXD) signature check.** An RXD swap with a build without the
+  Radiant signature dialect did not complete in the 0.3.0 tests (see Known limitations); a typed
+  error for the four signature-hash cases the dialect treats as fatal is a later step. More in
+  [`rxd-signature-version-support`](docs/plans/rxd-signature-version-support.md) (step 8).
 
 ### Known limitations
 
@@ -1418,6 +1518,25 @@ lives.
   since this release (PR #291); the GLEEC release does not, so such swaps fail intermittently. A
   GLEEC node that sells SC as the order base is not affected. Detail: PRs #239, #291; CRD ch.20
   R-N4.
+- **Siacoin (SC) swaps: what is not covered.** SC swaps run on the first swap protocol only; the
+  second protocol is not implemented for SC. A node that watches other traders' swaps can refund a
+  Siacoin payment for an offline taker but cannot spend the maker's payment for it. Every Siacoin
+  swap transaction pays a fixed fee of 0.00002 SC, about 450 to 850 times below the rate the Sia node
+  recommended for the transaction's size in the tests; every such transaction so far was mined in
+  the next block, and the fee has not been tested under load. Manual recovery (`recover_funds_of_swap`) of a Siacoin swap
+  was tested only on swaps whose record already held the final event; it refused each time and
+  broadcast nothing, as it should, so the recovery method's chain reading for a Siacoin payment has
+  unit tests only; a taker that was stopped after its Siacoin payment and resumed after its lock did
+  find the maker's spend on chain and completed the swap (November 10, 2026). Siacoin in a browser
+  (WASM) build is untested. A GLEEC KDF
+  3.0.0-beta maker on netid 6133 validated a KDF Reloaded taker's Siacoin fee at the network's base
+  rate on November 10, 2026, with its Sia node's pool reply passed through a lab proxy that rewrites
+  the entry it cannot read (see the item above), and that swap completed. The same check at netid
+  8762's discounted rate, with KMD in the pair, passed the same day against a GLEEC KDF development
+  build, again behind that proxy, standing in for the netid-6133 discounted case (GLEEC in the pair),
+  which needs GLEEC and was not run; without the proxy the development build failed twice at the pool
+  reply (see the item above). The fee rule and the fee address are the same on both nodes. Detail:
+  PRs #239, #278, #290, #291; CRD ch.20 D5, D7, R-S8, R-S11, R-S12, T-S1.
 - **Lightning cannot place orders or swap.** Orders and trade previews involving a Lightning coin
   are refused with an error naming the coin; `trade_preimage` answers `TradingNotSupported`. More in
   [`lightning-activation-features`](docs/plans/lightning-activation-features.md). Detail: PR #66; CRD
@@ -1432,9 +1551,14 @@ lives.
 - **TRON (TRX, TRC20) and Solana (SOL, SPL) cannot be activated in this beta.** Their support is not
   finished. TRON activation answers "TRON support is not available in this build";
   `enable_solana_with_tokens` and `enable_spl` answer "Solana support is not available in this
-  build"; the rest of the node is unaffected. Both are planned to return in the next beta. More in
+  build"; the rest of the node is unaffected. TRON stays switched off in this beta because its
+  wallet path (balance, address and broadcast) was only now wired, its node client has no time limit
+  per request and no API-key handling yet, its transaction history is not available, and its
+  activation route and swaps are unfinished; it returns in a later version. Solana stays switched
+  off as well: the Solana SDK the build uses is pinned to a version that could only be upgraded
+  through a fork. More in
   [`tron-support`](docs/plans/tron-support.md) and [`solana-support`](docs/plans/solana-support.md).
-  Detail: PR #93.
+  Detail: PRs #93, #333.
 - **Tendermint (Cosmos) coins are wallet-only in this beta.** Activation, balances and withdrawals
   work; orders and swaps are planned to return in a later release. A swap already in progress still
   completes, and an order with a Tendermint coin saved by an earlier version is cancelled at startup.
