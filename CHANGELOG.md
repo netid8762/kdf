@@ -12,6 +12,60 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 Within each heading, entries are grouped by area. Each entry ends with the pull request that made
 it and, where one exists, the CRD rule, for readers who want more.
 
+### Highlights
+
+The most important changes of this release in short. Each item points to the detailed entry below.
+
+#### What is new
+
+- **Siacoin (SC) swaps are supported.** PRs #239, #278, #290, #291.
+- **Electrum servers that fall behind the chain or stop following it are no longer asked, and
+  servers that disagree about the chain stop the coin from trading.** PR #324.
+- **Under an HD login, each coin trades, withdraws and keeps its accounts with its own key and
+  address.** PRs #249, #250, #253, #254, #270, #279, #281, #293.
+- **ARRR pays Pirate1 addresses and declines swaps with nodes that cannot build the Ironwood
+  format.** PRs #229, #230, #241, #246.
+- **Bitcoin II (BC2) works with its sighash suffix (with the `sighash_suffix` key in the coin
+  entry), and an Electrum server can be pinned by its key.** PRs #261, #264, #273.
+- **The order book holds up better: a lost cancellation heals sooner, and stuck connections, cut
+  links and sync gaps recover faster.** PRs #207, #223, #243, #258, #280, #303, #328.
+- **Prices come from two sources that check each other.** PRs #287, #326.
+- **Tendermint coins take custom tokens, `path_to_address` and the chain's priority gas prices.**
+  PRs #319, #323.
+- **Releases ship Linux ARM builds and the mobile libraries with a C header.** PRs #300, #321.
+- **Compatibility switches restore GLEEC KDF behavior where KDF Reloaded differs.** More in
+  [`RELOADED_VS_GLEEC.md`](RELOADED_VS_GLEEC.md).
+
+#### Major fixes
+
+- **A swap between Siacoin, or another coin with a 32-byte hash lock, and an EVM coin or token can
+  complete.** PR #290.
+- **An EVM taker on a chain with fast blocks, such as Monad, finds the maker's spend, also when it
+  comes late, shortly before a refund.** PRs #248, #255.
+- **`recover_funds_of_swap` no longer refunds a maker payment after the spend of the taker payment
+  was sent.** PRs #276, #284.
+- **A coin with several Electrum servers no longer fails to activate when one server is silent and
+  another refuses.** PR #324.
+- **An order whose save failed no longer comes back after a restart.** PRs #309, #314.
+- **The ARRR history names recipients, a swap's addresses and the fees of the wallet's own sends.**
+  PRs #268, #271, #277, #288.
+- **SLP withdrawals no longer give BCH to the miner (unit tests), and BCA HTLC spends and refunds can
+  be built.** PRs #220, #221, #236.
+
+#### Warnings and gaps
+
+All of these are described under Not in this release and Known limitations below.
+
+- **Do not run two KDF instances on the same seed at the same time.**
+- **The swap watcher does not work yet**, so keep your node running until your swaps have finished.
+- **TRON and Solana cannot be activated, and Tendermint coins are wallet-only.**
+- **ZEC cannot send since the Zcash network upgrade NU7; do not trade ZEC.**
+- **ARRR swaps work only between two KDF Reloaded nodes of this release or later**; native mode and
+  the Ironwood pool are postponed.
+- **Every Siacoin swap transaction pays a fixed fee about 450 to 850 times below the rate the Sia
+  node recommends**, and some Siacoin recovery paths have unit tests only.
+- **Under a Trezor key, some UTXO operations are not available.**
+
 ### Upgrade note: name lookups go to Google Public DNS
 
 **If your node runs on a network that blocks Google Public DNS, set `dns_resolver` before you
@@ -250,9 +304,9 @@ A login without `enable_hd` is not affected. Detail: PR #319; CRD ch.36 R36.1.2,
 - **Every pull request now builds the node for 64-bit ARM Linux.** The check cross-builds `kdf` for
   aarch64, tests the glibc floor and starts the binary under an emulator, so a change that breaks
   the ARM build is found before it merges. It is not a required check at first; it becomes one after
-  about ten green runs on `dev` (roughly two weeks). Detail: the Tests workflow.
-- **The mobile libraries now also cover the Android x86_64 ABI and the iOS simulator.** Each signed release carries `libkdf.a` for Android x86_64 (emulators and Chromebooks), and for the iOS simulator on Apple silicon (`aarch64-apple-ios-sim`) and Intel (`x86_64-apple-ios`) Macs, as separate libraries next to the device one. The dev and staging builds carry them too. Detail: `docs/RELEASE_ARTIFACTS.md`.
-- **Releases now include a C header for the mobile libraries.** `kdf-<tag>.h` declares the functions of `libkdf.a` with their exact prototypes and the log callback type, so an Android or iOS app can call the library without writing the declarations itself. CI builds the library, compiles and runs a test program against the header, and checks that the header and the library agree. Detail: the Release workflow and `docs/RELEASE_ARTIFACTS.md`.
+  about ten green runs on `dev` (roughly two weeks). Detail: PR #320; the Tests workflow.
+- **The mobile libraries now also cover the Android x86_64 ABI and the iOS simulator.** Each signed release carries `libkdf.a` for Android x86_64 (emulators and Chromebooks), and for the iOS simulator on Apple silicon (`aarch64-apple-ios-sim`) and Intel (`x86_64-apple-ios`) Macs, as separate libraries next to the device one. The dev and staging builds carry them too. Detail: PR #321; `docs/RELEASE_ARTIFACTS.md`.
+- **Releases now include a C header for the mobile libraries.** `kdf-<tag>.h` declares the functions of `libkdf.a` with their exact prototypes and the log callback type, so an Android or iOS app can call the library without writing the declarations itself. CI builds the library, compiles and runs a test program against the header, and checks that the header and the library agree. Detail: PR #321; the Release workflow and `docs/RELEASE_ARTIFACTS.md`.
 - **Releases now include Linux builds for 64-bit and 32-bit ARM, and the mobile libraries.** Besides the x86_64 binary, each signed release carries `kdf` for aarch64 and armv7 Linux (glibc 2.31 or newer, like the x86_64 one), and `libkdf.a` static libraries for Android (aarch64 and armv7) and iOS (aarch64) apps. The macOS binary that runs on both Intel and Apple silicon is attached as well; earlier releases did not include it. Every file is in the signed checksum list. The names, target triples and minimum system versions are in `docs/RELEASE_ARTIFACTS.md`. Detail: PR #300.
 
 ### Changed
@@ -784,6 +838,28 @@ A login without `enable_hd` is not affected. Detail: PR #319; CRD ch.36 R36.1.2,
 
 #### ARRR and other shielded coins
 
+- **A Windows user profile path with non-ASCII characters no longer crashes ARRR activation.** The
+  default Sapling parameter directory was read through a call that returns the profile path in the
+  ANSI code page and was converted without a check, so a user name such as one with accented letters
+  made the activation task panic and never answer. The default directory of ARRR, and the default data
+  directory that native-mode UTXO coins and QRC20 coins use to find their daemon configuration file,
+  are now read losslessly (the `APPDATA` variable first, then the system's known-folder lookup; the
+  home directory on other systems). A lookup that fails is reported as an activation error that
+  names the reason and, for ARRR, `zcash_params_path` as the remedy, never as a crash. Checked with
+  unit tests on Linux and with a Windows profile run of this PR's build on 2026-11-12 (profile path
+  with non-ASCII characters: two activation attempts without the parameter files returned reported
+  errors, the third activated and scanned, one swap as maker finished with the node spending the
+  shielded HTLC payment, 0 panics); the Windows variant of the unit test has not executed (the
+  Windows CI job builds only). Detail: PR #346; CRD ch.39, status note of 2026-11-12 (Sapling
+  parameter path).
+
+- **A shielded broadcast now logs the identifier the server returned beside the local one.** In
+  light mode the lightwalletd service answers a successful broadcast with the identifier its node
+  accepted. The node used to discard the answer and log only the identifier it computed from the
+  bytes. It now logs both in one `info` line, and writes a `warning` when they differ. The identifier
+  the node returns to the caller is still the locally computed one. The lines name no server.
+  Detail: CRD ch.39, status note of 2026-11-12 after R39.11.30.
+
 - **The node no longer sends a shielded transaction again that is already mined.** Before a
   light-mode broadcast it looks the transaction id up in the wallet database. A transaction the
   database holds as mined is refused with an error that names its state ("mined in block N"), and
@@ -981,6 +1057,29 @@ A login without `enable_hd` is not affected. Detail: PR #319; CRD ch.36 R36.1.2,
   unit tests only; nobody has yet watched it on a stalled node in real time. More in the release tests,
   [finding F4](docs/release-tests/0.4.0-beta.1.md#findings-and-dispositions). Detail: PR #306; CRD
   ch.51 R79-R81.
+- **A maker whose claim of the taker payment was mined no longer refunds its own payment after the
+  claim call or the wait for the claim's confirmation failed.** Before, the swap went to the refund
+  without looking at the taker coin's chain, so a claim that was in fact mined could be followed by
+  a refund, and the maker then held both payments. Now the swap first searches the taker coin's
+  chain for the spend of the taker payment. When the spend is found, the swap completes with the
+  spend and no refund is made; the swap completes only when that spend is confirmed, and a spend
+  that is found but not confirmed holds the refund like an unreadable chain. When the taker's refund
+  is found, or nothing is found, the refund goes on as before. When the chain cannot be read, the
+  refund is held and the search repeated until the refund deadline; the swap then ends with a failed
+  refund whose text says the state of the taker payment could not be determined on that coin (or
+  that the claim is found but not confirmed), and manual recovery applies. Swaps that never reached
+  the claim are unchanged. Detail: CRD ch.51 R82.
+- **A maker whose claim of the taker payment was lost, and whose taker then refunded, can now
+  recover its own payment with `recover_funds_of_swap`.** Before, the call refused, because the
+  record holds the sent claim and the maker payment was taken to belong to the taker, although the
+  claim never reached the chain and the taker had refunded: the maker then held neither payment.
+  Now the call first looks at the taker payment on its own chain, and refunds the maker payment only
+  when the taker's refund of the taker payment is found with at least one confirmation. When the
+  maker's own claim is found and confirmed, the call refuses as before. When the claim is found but
+  not confirmed, or the chain cannot be read, or a found refund has no confirmation, it refuses and
+  says so. When nothing spent the taker payment yet, it refuses and says to repeat the call once
+  the taker has refunded. A refusal builds nothing and writes nothing. A completed swap is refused
+  as before. The automatic refund of the run loop is unchanged. Detail: CRD ch.51 R83.
 
 #### UTXO coins and Electrum
 
@@ -1201,6 +1300,15 @@ A login without `enable_hd` is not affected. Detail: PR #319; CRD ch.36 R36.1.2,
 
 ### Documentation
 
+- **The design documents, plans and release documents were kept current through the cycle.** The
+  CRD gained a coverage note on three unmerged reference pull requests, chapter 63 on TRON GasFree
+  fee delegation, and a correction of the Radiant relay-fee finding; plans were opened for the
+  mmrpc 2.0 forms of the legacy-only methods, refreshed for TRON and trading floors, and brought in
+  line with their states before this release; the compatibility documents, the release notes and
+  the release-tests page were updated at each batch close. The node itself is unchanged. Detail:
+  PRs #202, #212, #295, #296, #298, #304, #307, #311, #316, #317, #318, #325, #334, #335, #336, #337;
+  the branch and version housekeeping of the cycle is in PRs #198, #217.
+
 - **The RPC method census notes two names that only KDF Reloaded routes on the legacy
   surface.** `peer_connection_healthcheck` answers on both envelopes here, and the test helper
   `sim_panic` on the legacy one; the census tables and totals, which count the reference, are
@@ -1238,18 +1346,19 @@ A login without `enable_hd` is not affected. Detail: PR #319; CRD ch.36 R36.1.2,
 Every plan this release touched in any sense since v0.3.0-beta.1, with what happened to it. Each plan
 file carries the detail. "New" means the plan was created in this cycle.
 
-- [`bc2-replay-protection`](docs/plans/bc2-replay-protection.md) — new, in progress: the Bitcoin II
+- [`bc2-replay-protection`](docs/plans/bc2-replay-protection.md) — new, parked: the Bitcoin II
   network has required an extra field in every signature digest since block 57,750, so
   transactions signed the ordinary way are rejected. The rule is written (CRD chapter 61, PR
   #261), and the signing change and the counterparty requirement are implemented (PR #264). On the
   live chain a withdrawal and a swap between two KDF Reloaded nodes passed, and the decline of a
   counterparty that does not sign with the suffix was checked (release tests, "BC2 confirmation" and
-  "BC2 swap check"). The coins-file entries and the P2PKH
-  live check are open.
+  "BC2 swap check"). The KDF Reloaded coins file carries the `BC2` and `BC2-segwit` entries since
+  2026-11-10; the shared coins list and the P2PKH live check are open.
 - [`arrr-htlc-lightwalletd-txwalk`](docs/plans/arrr-htlc-lightwalletd-txwalk.md) — planning: its target now reads "after the 0.4.0 beta".
-- [`arrr-ironwood-compatibility`](docs/plans/arrr-ironwood-compatibility.md) — in progress: the field tests of 2026-10-26 to
-  2026-10-29 are recorded, and the two open items of the earlier deadline are closed as history; a
-  live GUI round trip on Windows (its gate 8) is still open.
+- [`arrr-ironwood-compatibility`](docs/plans/arrr-ironwood-compatibility.md) — done: the field tests of 2026-10-26 to
+  2026-10-29 are recorded, and the two open items of the earlier deadline are closed as history.
+  Its last gate, a live HTLC round trip from the desktop wallet on Windows (gate 8), passed with an
+  ARRR buy on 2026-11-11 and an ARRR sale on 2026-11-12.
 - [`arrr-native-and-ironwood-pool`](docs/plans/arrr-native-and-ironwood-pool.md) — planning: what
   Komodo and GLEEC KDF do with a Pirate `pirate1…` address is now recorded, and so is the fact that
   they would still trade with a KDF Reloaded ARRR order that adds a capability marker after its
@@ -1299,7 +1408,12 @@ file carries the detail. "New" means the plan was created in this cycle.
   check from field logs and the repeated-cancel refresh are open.
 - [`gossip-send-queue-bound`](docs/plans/gossip-send-queue-bound.md) — done: its follow-ups now name the PRs they shipped in
   (CRD PR #129; PRs #148, #159, #160, #166).
-- [`hd-key-unification`](docs/plans/hd-key-unification.md) — new, in progress: under an HD login, one
+- [`hd-account-storage-on-path-change`](docs/plans/hd-account-storage-on-path-change.md) — new,
+  planning: after a change of a coin's `derivation_path`, KDF Reloaded removes the coin's stored HD
+  accounts and starts it as a new HD wallet at the new path, where GLEEC KDF keeps the earlier
+  accounts in use. This release documents the behavior (Known limitations); the options for a
+  friendlier handling are analyzed after the beta.
+- [`hd-key-unification`](docs/plans/hd-key-unification.md) — new, parked: under an HD login, one
   swap key per coin and one trading identity for the node. Eight work packages, starting with
   corrections to the documentation (PR #228) and with refusing up front the swaps that cannot
   complete, which is now done (item H1: `swap_key_check`, PRs #231, #233), as is one swap key per
@@ -1323,7 +1437,7 @@ file carries the detail. "New" means the plan was created in this cycle.
   was measured in two 6.5-hour runs and on start-up, activation, eight swaps and query latency; no cost
   was resolved and the default stays (PR #225); executor sizing and an allocator comparison wait for
   their triggers.
-- [`order-posting-latency`](docs/plans/order-posting-latency.md) — in progress: the rule that
+- [`order-posting-latency`](docs/plans/order-posting-latency.md) — parked: the rule that
   spreads read-only Electrum queries only over the servers with the shortest round trip is written,
   with its two switches and their defaults (PR #201), and implemented (PR #215). The SwapLab timing
   rows ran on 2026-11-06: on RIN orders were posted in a quarter to a third of the time, and on DOGE
@@ -1331,8 +1445,8 @@ file carries the detail. "New" means the plan was created in this cycle.
   0.3.0-beta.1, is written (PR #260) and implemented (PR #262), and the SwapLab run on it passed
   (release tests, rows 4–8). The opt-in `setprice_replace_after_checks`, which replaces the previous
   orders only after the new order passes its checks, is written (PR #265) and implemented (PR #286);
-  a lab row with a failing check passed on 2026-11-08, to be recorded on the release-tests page with
-  the third batch's close.
+  a lab row with a failing check passed on 2026-11-08 (release tests, "Setprice option"). Nothing
+  else is in flight; the tip check (work package 5) has not started.
 - [`orderbook-queue-and-history-caps`](docs/plans/orderbook-queue-and-history-caps.md) — parked: PRs #131, #134, #137 and #164
   are merged; the early-purge point waits for the maintainer.
 - [`orderbook-wipe-recovery`](docs/plans/orderbook-wipe-recovery.md) — parked: the CRD and both switches are merged (PRs #132,
@@ -1343,7 +1457,8 @@ file carries the detail. "New" means the plan was created in this cycle.
   shares and the queue-signal fix (PRs #204, #214), and one resolver for every hostname (PRs #216,
   #219); the remaining lookups (Sia, WalletConnect, Lightning, statistics) and encrypted DNS are
   new rows for later. A close that a non-reading peer would hold forever now ends after 30 seconds
-  (item P6, PR #280).
+  (item P6, PR #280). A hold-off for peer addresses that cannot be reached is a new row for a later
+  release (item P9; Known limitations).
 - [`rpc-api-reference-wire-parity`](docs/plans/rpc-api-reference-wire-parity.md) — parked: it records that PRs #17 and #21 landed.
 - [`rxd-signature-version-support`](docs/plans/rxd-signature-version-support.md) — parked: it records that PRs #54 and #65 landed,
   with their compatibility bookkeeping, and the 2026-11-09 mainnet swap tests; step 8 (a stricter signing of malformed
@@ -1356,22 +1471,26 @@ file carries the detail. "New" means the plan was created in this cycle.
 - [`solana-support`](docs/plans/solana-support.md) — parked: Solana stays switched off; the release it returns in is not
   set.
 - [`tendermint-activation-features`](docs/plans/tendermint-activation-features.md) — parked: Tendermint swaps were added to the
-  0.4.0 scope on 2026-11-08; accepting both forms of the activation parameters is decided and not
+  0.4.0 scope on 2026-11-08 and put aside again on 2026-11-10 by the maintainer's decision; the
+  coins stay wallet-only. Accepting both forms of the activation parameters is decided and not
   started. Two of its features are implemented: custom tokens (wallet-only) and the HD
-  `path_to_address` (PR #319).
-- [`trading-floors-parity`](docs/plans/trading-floors-parity.md) — in progress: how Komodo and
+  `path_to_address` (PR #319). The trade-fee row owed by PR #323 passed on 2026-11-10 on a local
+  chain.
+- [`trading-floors-parity`](docs/plans/trading-floors-parity.md) — done: how Komodo and
   GLEEC KDF charge an explicit `UtxoFixed` withdraw fee (in proportion to the size) is now
   recorded (PR #222), and KDF Reloaded now charges it the same way on UTXO coins (PR #226). On an SLP
   token withdrawal they charge it in proportion too; that is now recorded (PR #232), and KDF
   Reloaded now charges it that way there as well (PR #234). The Sia floor was revised (PR #278), and
   the UTXO change-fee rounding found in the release tests was fixed (PR #247). The default-side arm 3 is chosen
   (2026-11-08): a raised advertised minimum, on by default, with a compatibility switch for the
-  reference value; its work is planned.
-- [`tron-gasfree`](docs/plans/tron-gasfree.md) — parked: TRON support was added to the 0.4.0 scope on 2026-11-08.
-- [`tron-support`](docs/plans/tron-support.md) — in progress: TRON support was added to the 0.4.0 scope on 2026-11-08; the
+  reference value; it is merged (PR #315), and the lab row L-MINVOL passed on 2026-11-09.
+- [`tron-gasfree`](docs/plans/tron-gasfree.md) — parked: TRON support was added to the 0.4.0 scope on 2026-11-08 and
+  stops at the wallet path (PR #333).
+- [`tron-support`](docs/plans/tron-support.md) — parked at the 0.4.0 freeze: TRON support was added to the 0.4.0 scope on 2026-11-08; the
   decisions a TRON swap needs were put to the maintainer that day. The activation route was decided
   on 2026-11-08 (work package 1), the wallet path's balance, address and broadcast are wired (work
-  package 4), and TRON stays switched off in this beta (decided 2026-11-10).
+  package 4), and TRON stays switched off in this beta (decided 2026-11-10). The work stops after PR
+  #333, the wallet path; swaps are not built.
 - [`tron-swap-support`](docs/plans/tron-swap-support.md) — parked: the chapter rewrite on its branch failed the KDF Dirty
   Gate on 2026-11-08 and is not reused; the reference's TRON swap state is recorded by a gated Spec
   Reader round that lands with the first TRON code PR.
@@ -1384,22 +1503,29 @@ file carries the detail. "New" means the plan was created in this cycle.
   closed by PR #219.
 - [`withdraw-entry-expiry-by-block-time`](docs/plans/withdraw-entry-expiry-by-block-time.md) — planning: it records that 0.3.0-beta.1 fixed
   the earlier problem (PR #181); the two ideas left are not in 0.4.0.
+- [`zec-v5-transactions`](docs/plans/zec-v5-transactions.md) — new, planning: since the Zcash
+  network upgrade NU7 the network accepts only transactions of version 5 or 6, and KDF Reloaded
+  builds ZEC transactions in the version-4 format, so ZEC cannot send (Known limitations). The plan
+  describes what a version-5 send needs, the options (the Zcash library already in the tree is
+  recommended) and the work items.
 
 ### Not in this release
 
 Work that was planned or started for this cycle but is postponed to a later version. Each item says
 why and where the plan lives; what a user meets today is under Known limitations below.
 
-- **TRON (TRX, TRC20) activation and swaps.** TRON support is not finished, so TRON activation
-  stays off in this beta (see Known limitations), and TRON swaps are not built yet. More in
-  [`tron-support`](docs/plans/tron-support.md).
+- **TRON (TRX, TRC20) activation and swaps.** The TRON work stops for this release at the wallet
+  path: balance, address and broadcast are in the code (PR #333) but cannot be reached, because TRON
+  activation stays off in this beta (see Known limitations). The activation route and TRON swaps
+  are not finished. More in [`tron-support`](docs/plans/tron-support.md).
 - **TRON GasFree (gasless TRC20 withdrawals).** It is specified (CRD ch.63) but not in this build:
   an earlier implementation stays parked on a branch and is not revived, and the new work needs
   TRON activation and a pinned GasFree proxy creation bytecode first. More in
   [`tron-gasfree`](docs/plans/tron-gasfree.md).
-- **Tendermint (Cosmos) orders and swaps.** Tendermint coins stay wallet-only; orders and swaps
-  return only with a swap plan of their own and its tests, which do not exist yet. The activation
-  features not built yet are in
+- **Tendermint (Cosmos) orders and swaps.** Tendermint coins stay wallet-only. Orders and swaps were
+  added to this release's scope on 2026-11-08 and put aside again on 2026-11-10 by the maintainer's
+  decision; they return only with a swap plan of their own and its tests, which do not exist yet.
+  The activation features not built yet are in
   [`tendermint-activation-features`](docs/plans/tendermint-activation-features.md).
 - **Solana (SOL, SPL).** Activation stays off: the support is not finished, and the Solana SDK the
   build uses is pinned to a version that could only be upgraded through a fork. More in
@@ -1444,6 +1570,24 @@ lives.
   and an HD coin has many. GLEEC KDF fails the same way, and this stays. Use `account_balance` for
   the balance and the mmrpc 2.0 `get_enabled_coins` for the list. For an EVM coin both legacy
   methods answer with the activated address. Detail: PR #228; CRD ch.05 §5.9B R35.
+- **Changing a coin's `derivation_path` makes it start as a new, empty HD wallet.** Under an HD
+  login with the seed as the key source, when a coin's `derivation_path` in the coins file changes
+  between two sessions, the coin's stored accounts no longer match the keys the seed derives under
+  the new path. KDF Reloaded removes them and logs one WARN per coin at each activation that removes
+  accounts, "removed N stored HD account(s) that the wallet's seed did not derive"; for this case
+  the wording is misleading, because the seed did derive them, under the previous path. The coin
+  then starts as a new HD wallet at the new path: the first account (or the one `path_to_address`
+  names) is created and, by default, its addresses are scanned up to the gap limit. Nothing is lost:
+  every address can be derived from the seed again at its path. To see the earlier addresses again,
+  restore the previous `derivation_path` and activate the coin. By default its addresses are scanned
+  again up to the gap limit. Other accounts are added again with `task::create_new_account`, and
+  addresses beyond the gap limit with `get_new_address`. Alternatively, move the funds and keep the
+  new path. A coin activated with a Trezor keeps its stored accounts. GLEEC KDF behaves differently:
+  the earlier accounts stay in use while the reported path is the new one. No switch changes this in
+  this release. Normal use does not change a coin's path; it takes an edit of the coins file, or a
+  switch between coins files that give a ticker different paths. Detail: CRD ch.05 §5.10B, status
+  note of 2026-11-11; plan
+  [`hd-account-storage-on-path-change`](docs/plans/hd-account-storage-on-path-change.md).
 - **Do not run two KDF instances on the same seed at the same time.** If you do, for any coin (RIN
   included), both instances can pick the same funds for two different transactions. The network
   accepts one and rejects the other, and the instance that loses gets no explanation and may try
@@ -1492,6 +1636,26 @@ lives.
   that relay received the cancellation. Until then the order stays visible. More in
   [`ghost-orders`](docs/plans/ghost-orders.md). Detail: PRs #188, #208, #224, #251; CRD ch.32 D12,
   R-Q5d, R-GH14.
+- **The log warns repeatedly about peer addresses that cannot be reached.** A node logs warnings
+  such as "P2P outgoing connection failed for peer …: Failed to negotiate transport protocol(s):
+  […]", where the brackets hold the operating system's connection-refused text ("os error 10061" on
+  Windows) or "Timeout has been reached", at most once per hour for each address. The wording comes
+  from the transport library; no protocol was negotiated, because each of these is a TCP connection
+  that was refused or timed out. The addresses are peer records that other nodes hand out in the
+  peer exchange and that no longer accept connections. KDF Reloaded relays store and pass on such
+  records the same way: a record is dropped only when a dial reaches a different peer, not when the
+  address is unreachable. The node asks a random known peer for more peers every 5 minutes; when the
+  dial fails, it drops that peer and asks another at once, and a live seed's next answer hands out
+  the same records again. A node that is not a relay and has fewer than 2 relays also dials them
+  while looking for relays, and each dial tries the address twice. In a 29-hour run of the desktop
+  wallet on Windows, 557 such warnings named 33 addresses of 32 peers; a check of all 33 on
+  2026-11-12, after the run, found none that accepted a connection (11 refused, 22 gave no answer);
+  two of them are the addresses that names still used for seed nodes resolve to. The effect is log
+  noise and wasted dials, and a peer-exchange request sent to such a peer waits for the dial to fail
+  before another peer is asked. Order books and swaps were not affected in that run, in which the
+  node stayed connected through its six configured seeds. A hold-off for unreachable addresses is
+  planned for a later release. Detail: CRD ch.28 R8c item 6; plan
+  [`p2p-dialing-and-discovery`](docs/plans/p2p-dialing-and-discovery.md).
 - **ARRR (Pirate) atomic swaps work only between two KDF Reloaded nodes of this release or later.**
   ARRR now uses a newer transaction format (v6, from the Ironwood upgrade) that no other KDF
   implementation can handle, so a swap with a Komodo or GLEEC counterparty cannot complete (observed
@@ -1530,6 +1694,16 @@ lives.
   planned for a later release. More in
   [`arrr-native-and-ironwood-pool`](docs/plans/arrr-native-and-ironwood-pool.md). Detail: PRs #229,
   #246; CRD ch.39 §39.6.5.
+- **ARRR swaps use the Sapling pool only.** An ARRR swap's HTLC payment is funded from the Sapling
+  pool, and its spend and refund pay into the Sapling pool. The Pirate network accepts an HTLC
+  payment only in a transaction that spends at least one Sapling note, so a payment funded from the
+  Ironwood pool alone is invalid; changing that needs a Pirate network upgrade, so KDF Reloaded
+  cannot offer swaps funded from the Ironwood pool until then. Funds held at an Ironwood (Pirate1,
+  `pirate1…`) address, for example in another Pirate wallet, must be sent to the wallet's Sapling
+  (`zs1…`) address before they can be traded. Withdrawals to a Pirate1 address, and incoming
+  payments that carry a Sapling output, keep working as described in the ARRR entries above. More in
+  [`arrr-ironwood-compatibility`](docs/plans/arrr-ironwood-compatibility.md). Detail: CRD ch.39
+  §39.6.5.
 - **The Komodo DeFi Framework and GLEEC KDF builds available in November 2026 cannot spend BC2
   (Bitcoin II).** Since block 57,750 the BC2 network rejects every spend signed without the chain's
   sighash suffix, and those builds do not sign with it, so they can neither withdraw BC2 nor complete
@@ -1591,6 +1765,17 @@ lives.
 - **SLP tokens on BCH are untested on mainnet.** The shared coins file lists BCH and tBCH as plain
   UTXO coins and carries no SLP token entries, so SLP tokens cannot be enabled with it. The SLP
   changes of this release are covered by unit tests only. Detail: PRs #234, #236.
+- **ZEC cannot send since the Zcash network upgrade NU7.** Since NU7 activated on the Zcash mainnet
+  (height 3,543,405), the network accepts only transactions of version 5 or 6 (ZIP 2003). KDF
+  Reloaded builds ZEC transactions in the version-4 format, so the network rejects every ZEC
+  withdrawal, swap payment and refund; a field report shows the rejection "transaction version 4 not
+  supported by the network upgrade Nu7". The balance, read from the Electrum servers, should still
+  show incoming payments (not tested); transactions made since NU7 may be missing from the history
+  or shown wrongly, because the node does not read the version-5 format yet. Do not place or take
+  ZEC orders: a swap fails at its first ZEC transaction, and a ZEC refund cannot be sent either. The
+  other Zcash-family coins of the coins file (KMD, ZER, BTCZ, FLUX) run their own networks; NU7 is
+  an upgrade of the Zcash network only. Detail: plan
+  [`zec-v5-transactions`](docs/plans/zec-v5-transactions.md); CRD ch.39 R39.11.15.
 - **TRON (TRX, TRC20) and Solana (SOL, SPL) cannot be activated in this beta.** Their support is not
   finished. TRON activation answers "TRON support is not available in this build";
   `enable_solana_with_tokens` and `enable_spl` answer "Solana support is not available in this
@@ -1616,6 +1801,13 @@ lives.
   activation log line says `gas_limit: defaults`. More in
   [`evm-swap-gas-multiplier`](docs/plans/evm-swap-gas-multiplier.md). Detail: PR #105, PR #200; CRD
   ch.57 R57.5.2, R57.5.3, R57.5.5.
+- **An EVM request fails at once when every node of the coin refuses it.** When every configured
+  node of an EVM coin refuses a request at the same moment (for example public endpoints answering
+  HTTP 429 Too Many Requests), the request fails at once; KDF Reloaded does not pause and retry.
+  Order placement and balance RPCs report the failure and can be repeated; a swap step without a
+  wait loop (taker-payment validation, the spend) fails the swap into its refund path. For an EVM
+  coin used for making orders, configure at least one node with its own request allowance. Detail:
+  CRD ch.35 R35.1.8, R35.1.11.
 - **A maker payment is not refunded after the spend of the taker payment was sent, even if that spend
   never confirms.** If the node's spend of the taker payment was broadcast but dropped from the chain,
   and the other side refunded its payment, `recover_funds_of_swap` refuses to refund the maker payment:
