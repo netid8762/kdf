@@ -127,6 +127,17 @@ The developer-facing rule (mandatory for AI assistants, strong recommendation fo
   names are additive and need no switch. See
   `docs/reloaded-rewrite/rpc-method-census.md`.
 
+- **Additional Solana coin-configuration forms.** Besides the forms GLEEC KDF
+  uses (`SOLANA` with `protocol_data: {}`, and `SOLANATOKEN` with `platform`,
+  `decimals`, `mint_address` and `program_id`), Reloaded reads its own older
+  forms: `{"type": "SOLANA"}` without `protocol_data`, and `SPLTOKEN` with
+  `platform`, `decimals` and `token_contract_address`, which means the SPL
+  Token program. The extra forms are additive and need no switch. Native
+  builds read all of these; browser (WASM) builds do not read Solana entries
+  yet. Solana stays switched off in this beta (see
+  [Removed / disabled](#removed--disabled-in-kdf-reloaded)). CRD ch.40
+  R40.1.2, R40.1.3; PR #361.
+
 - **Opt-in: an absent `max_eth_tx_type` read as unrestricted.** By default
   Reloaded reads a coin configuration with no `max_eth_tx_type` key as GLEEC KDF
   does: the coin may send untyped (legacy) transactions only, and an EIP-1559
@@ -226,8 +237,8 @@ The developer-facing rule (mandatory for AI assistants, strong recommendation fo
   with a suffix refuses a hardware signing request before the device is
   contacted. A BC2 entry without the key still activates and logs one warning
   that the network will refuse its transactions. A coin without the key signs
-  exactly as before. The shared coins list must carry the key on the `BC2` and
-  `BC2-segwit` entries. **No switch returns the ordinary signature:** the
+  exactly as before. The shared coins repository carries the key on the `BC2` and
+  `BC2-segwit` entries since 2026-11-14. **No switch returns the ordinary signature:** the
   Komodo DeFi Framework 2.6.0-beta and the GLEEC KDF development build
   `a12695e` (the two builds measured) cannot sign BC2 transactions after block
   57,750 at all, so there is no reference behavior to return to. **BC2 swaps
@@ -238,17 +249,29 @@ The developer-facing rule (mandatory for AI assistants, strong recommendation fo
   Set `require_suffix_counterparty` to `false` in the coin entry to admit them;
   a swap with them still cannot complete when they have to spend BC2. This
   check is temporary and will be removed as soon as the other implementations
-  support suffix signing. The global coins repository may not carry the
-  `sighash_suffix` key on the `BC2` and `BC2-segwit` entries yet: until it
-  does, add it to your coins file or use the KDF Reloaded coins file, because
-  without it the BC2 network rejects BC2 withdrawals and swaps. See
+  support suffix signing. A coins file from before 2026-11-14 may lack the
+  `sighash_suffix` key on the `BC2` and `BC2-segwit` entries: add it, or use
+  the KDF Reloaded coins file, because without it the BC2 network rejects BC2
+  withdrawals and swaps. See
   [`docs/GLEEC_COMPATIBILITY.md`](docs/GLEEC_COMPATIBILITY.md) and
   [`docs/plans/bc2-replay-protection.md`](docs/plans/bc2-replay-protection.md).
+- **A clock check against NTP time servers.** At start, every hour and after the computer slept
+  or its clock was set, the node takes the median clock offset from NTP time servers
+  (`0.pool.ntp.org` to `3.pool.ntp.org` by default, or the servers in `ntp_servers`). A clock more
+  than 10 seconds off stops the node at start, so swaps in progress wait until it starts with a
+  correct clock; while it runs, new orders and swap starts are refused until the clock is right
+  again, and running swaps and withdrawals go on. When no server
+  answers the node warns and goes on, unless `ntp_required` is `true`. `"ntp_servers": []` turns
+  the check off. Nothing changes on the wire. Contract:
+  [CRD ch.45 §45.6C](docs/reloaded-rewrite/45-startup-configuration-and-environment-tolerance.md).
+  Plan: [`docs/plans/startup-clock-check.md`](docs/plans/startup-clock-check.md).
 
 ### Behavioural divergences without a compatibility switch
 
 These are divergences from GLEEC KDF that no compatibility switch reverses in this release. They are logged here and in [`CHANGELOG.md`](CHANGELOG.md) per the convention; a per-feature switch may be added in a later release. Where an entry names a setting, that setting adjusts the KDF Reloaded behavior it describes and does not restore GLEEC KDF's.
 
+- **Order-management methods under `mmrpc: "2.0"`.** `setprice`, `update_maker_order`, `cancel_order`, `cancel_all_orders`, `my_orders` and `order_status` are legacy-only in GLEEC KDF: a versioned request answers `NoSuchMethod`. KDF Reloaded also routes them on the versioned surface, with the legacy members inside `params`, the legacy result under `result`, typed errors with HTTP statuses, and unknown `params` members ignored. The legacy forms and their success bodies are unchanged; a legacy error text no longer carries the inner `file:line]` trace tokens. Additive; no switch. Plan: [`docs/plans/mmrpc-v2-completion.md`](docs/plans/mmrpc-v2-completion.md); CRD ch.43 D43.1A.1 status note.
+- **Trading methods under `mmrpc: "2.0"`.** `buy`, `sell`, `orderbook_depth` and `orders_history_by_filter` are legacy-only in GLEEC KDF. KDF Reloaded also routes them on the versioned surface in the same way as the order-management methods above (legacy members inside `params`, legacy result under `result`, typed errors with HTTP statuses, unknown `params` members ignored; legacy forms and success bodies unchanged). `get_trade_fee` stays legacy-only, as the reference documentation marks it deprecated in favor of the versioned `trade_preimage`. Additive; no switch. CRD ch.43 §43.1R.
 - **Withdraw with an omitted HD `from`.** For an HD-mode UTXO wallet, `withdraw` and `task::withdraw` with no `from` sender spend from the coin's activated address, the address at `path_to_address` (by default account 0, external chain, index 0), instead of failing. GLEEC KDF rejects an omitted `from` with `FromAddressNotFound`. This makes the shipped Komodo DeFi wallet's withdraw-preview flow (which omits `from`) work against a reloaded node; the maintainer kept it deliberately on 2026-11-04, set the address on 2026-11-06, and no switch is planned. An explicit but invalid `from` is still rejected (`UnknownAccount` / `UnexpectedFromAddress`) on both methods. Until plan [`hd-key-unification`](docs/plans/hd-key-unification.md) item H5 (PR #270), the fallback was always account 0, external chain, index 0, and the direct `withdraw` method refused an HD UTXO wallet. Code: `coins/utxo/utxo_common/utxo_common_hd.rs` (`get_withdraw_hd_sender`), `utxo_withdraw.rs` (`resolve_withdraw_sender`), `utxo_common_helpers.rs` (`withdraw_with_hd_sender`, `validate_task_withdraw_sender`).
 - **An HD account number already in use.** `task::create_new_account` with an `account_id` that the wallet already holds ends the task with `AccountAlreadyExists` (with the `account_id`) before any key is derived; `task::create_new_account::status` reports it. GLEEC KDF derives the key first and then reports an internal error. Only a client that asks for an existing account sees the difference. The same task also serves Siacoin, which GLEEC KDF does not offer HD accounts for; that is a Reloaded extension (the maintainer's decision of 2026-11-04). Plan [`hd-key-unification`](docs/plans/hd-key-unification.md) item H5.4 (PR #279); CRD ch.05 R35c. Code: `coins/hd_wallet.rs` (`choose_new_account_id`), `coins/rpc_command/init_create_account.rs`.
 - **`get_my_address` while a Trezor is initialized.** For an EVM coin that is not activated, KDF Reloaded derives the reported address from the login's key, also when a Trezor context exists. GLEEC KDF derives it from the device whenever a Trezor context exists. As on GLEEC KDF, each coin takes its keys and stores its accounts by its own key policy, and only a coin activated for the Trezor is refused key export. Two points still differ: a new address of a coin activated for the Trezor is not confirmed on the device, and the BCH activation task refuses the Trezor policy (CRD ch.05 §5.10B). Batch 4 item B4-2 (PR #293); CRD ch.05 §5.10B R57 and D7.e.
@@ -601,6 +624,34 @@ These are divergences from GLEEC KDF that no compatibility switch reverses in th
   `enable_eth_with_tokens` and the `task::enable_eth::*` family, and refuses
   them on the legacy methods, so a client written for GLEEC never sends such a
   request (CRD ch.21 §21.4, ch.55 D55.5).
+- **A Tendermint activation refuses a hardware key policy.** A request that names the `Trezor` `priv_key_policy`
+  fails before any node is contacted, with a `PlatformCoinCreationError` (HTTP 500) that says the hardware key policy
+  is not supported for Tendermint coins and to activate with the local key; GLEEC KDF ignores the member and activates
+  with the local key. An absent value, `ContextPrivKey` and `IguanaPrivKey` activate as before. Any other value, such
+  as the WalletConnect form (not built yet), fails request parsing with `InvalidRequest` (HTTP 400). No switch exists.
+  CRD ch.36 §36.7. PR #358.
+- **A Tendermint coin's transaction history differs from GLEEC KDF in three ways.** (1) While the first read of the
+  chain runs, the history state is `InProgress` (with `{"transactions_left": n}`); GLEEC KDF reports `NotStarted`
+  until the first read ends (§36.14.1 R36.14.11), and a failed first balance read ends its fetcher silently where KDF
+  Reloaded retries it (§36.14.1 finding 4).
+  (2) A fee-only transaction counts its fee once (GLEEC KDF counts it twice), a reward claim counts the fee it cost
+  (GLEEC KDF leaves it out), a transaction that touches several validators gets one row per validator (GLEEC KDF one
+  row) (all three: §36.14.1 finding 5), and `tx_hex` holds the signed transaction (GLEEC KDF the first message, which
+  cannot be broadcast; D36.12). (3) A denomination resolves as at GLEEC KDF (§36.14.1 finding 7): the platform's `denom`
+  exactly, otherwise the first coins-file entry with that denomination whatever its platform, so a coins-file token
+  of another platform is counted and shown under the entry's ticker (the activated token's ticker when one is
+  activated); a custom token absent from the coins file is not counted and has no history in 0.5.0. When what the
+  coins file resolves changes, the history store of the platform coin is read again from the chain. A fee that is
+  not one coin of the platform denom enters no amount (the platform entry is read wherever it stands in the fee
+  list), and a transaction with an empty fee list, and a staking event without a `delegator` attribute when the
+  transaction has exactly one staking message of that kind, get rows, where GLEEC KDF writes none; for these
+  transactions amounts and rows can differ from GLEEC KDF's (§36.14.6 D36.19, D36.20). The row identifier and the stored form
+  are meant to be the same as GLEEC KDF's (the position counting follows the cleared §36.14.6; not yet checked against a store GLEEC KDF wrote), so a data directory can move between
+  the two (§36.14.1 findings 1 and 2). No switch exists. Native builds only. CRD ch.36
+  §36.14.1 (D36.10, D36.11, D36.12, D36.13, D36.19, D36.20, D36.21). A history database is per coin and shared
+  by every account activated on it, so rows of an earlier account stay and are listed under their own addresses,
+  as at GLEEC KDF (D36.23). A transaction whose block time no node gives is read again by the next pass
+  (D36.24; GLEEC KDF leaves it out of that pass). PR #363.
 - **Tendermint (Cosmos) coins and tokens are wallet-only in this beta.**
   Activation, balances and `withdraw` work; `setprice`, `buy`, `sell` and
   `start_swap` refuse the coin with the usual "… is wallet only" answer, and an
@@ -795,7 +846,8 @@ behavior, except for `swap_key_check`; the row of each switch in
   trip (with spreading on, reads always take turns among at least the two fastest connected
   servers when two or more are connected), then have no effect.
 - `electrum_server_order: "listed"` — a coin's Electrum servers are ranked in the order they are
-  listed instead of by a random draw.
+  listed instead of by measurement (`mixed`, the default since 2026-11-14; `random` gives the
+  earlier default, a random draw).
 - `electrum_tip_checks: false` — the node does not compare the block heights of a coin's Electrum
   servers, does not fail an activation or refuse trades when they disagree about the chain: a server
   that is behind the chain or stopped following it keeps its place in reads, broadcasts and a swap's
@@ -851,6 +903,9 @@ node with `netid` unset or `0` refuses to start; set `8762` or `6133`.
 `dns_resolver` has no GLEEC-compatible value: the default matches GLEEC KDF for seeds and
 `"system"` matches it for coin servers; see its row in
 [`docs/GLEEC_COMPATIBILITY.md`](docs/GLEEC_COMPATIBILITY.md).
+
+`ntp_servers` set to `[]` turns off the clock check against NTP time servers, a KDF Reloaded
+addition; see its row in [`docs/GLEEC_COMPATIBILITY.md`](docs/GLEEC_COMPATIBILITY.md).
 
 ## Detail sections
 

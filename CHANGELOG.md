@@ -9,6 +9,205 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 <!-- How to add an entry: put it under the matching ### group and #### area (add the area heading if it is missing), as a bold one-sentence summary in plain words, then the detail, ending with "Detail: PR #N; CRD ch.X RY". -->
 <!-- The same PR updates every affected document: the CRD chapter, the plan body and its "Plans touched" row, RELOADED_VS_GLEEC.md, docs/GLEEC_COMPATIBILITY.md and "Known limitations" below; a plan's Status line is left to the maintainer. -->
 
+### Added
+
+#### Start-up and configuration
+
+- **The node checks the computer's clock against time servers.** At start, and again every hour
+  and after the computer slept or its clock was set, the node asks NTP time servers for the time
+  and takes the median of their answers. Swaps rely on the clock for their lock times and
+  deadlines. A clock more than 10 seconds off stops the node at start with an error that says by
+  how much the clock is off; swaps that were in progress then wait until the node starts with a
+  correct clock, so setting the clock right is urgent. While the node runs, it refuses new orders
+  and new swaps until the clock is right again; running swaps and withdrawals go on. By default
+  the node asks `0.pool.ntp.org` to `3.pool.ntp.org`; `ntp_servers` in `MM2.json` lists other
+  servers, and `[]` turns the check off. When no server answers, the node logs a warning and goes
+  on, unless `ntp_required` is `true`. Browser builds cannot send the queries and skip the check.
+  Detail: PR #348; CRD ch.45 §45.6C.
+
+#### RPC interface
+
+- **The order-management methods `setprice`, `update_maker_order`, `cancel_order`, `cancel_all_orders`,
+  `my_orders` and `order_status` accept `mmrpc: "2.0"` requests.** A versioned request carries the legacy
+  members unchanged inside `params`, gets the legacy result under `result` with the request's `id` echoed,
+  and a typed `error_type` with an HTTP status instead of the legacy error string: a request the client
+  got wrong (unknown coin, unknown order, a volume or price below the minimum, not enough balance) answers
+  400, a failure of the node 500, and a refusal while the computer's clock is off 503. An unknown member
+  inside `params` is ignored. The legacy forms of the six methods and their answers are unchanged, except
+  that a legacy error text no longer carries the inner `file:line]` trace tokens. This is a KDF Reloaded extension; the reference answers
+  `NoSuchMethod` for these names under `mmrpc: "2.0"`. The remaining legacy-only methods follow in later
+  releases (plan `docs/plans/mmrpc-v2-completion.md`). Detail: PR #359; CRD ch.43 §43.1R, D43.1A.1 status note.
+- **The trading methods `buy`, `sell`, `orderbook_depth` and `orders_history_by_filter` accept `mmrpc: "2.0"`
+  requests**, in the same way as the order-management methods above: legacy members inside `params`, legacy
+  result under `result` with `id` echoed, typed `error_type` with an HTTP status (400 for a request the client
+  got wrong, 500 for a node failure, 503 while the computer's clock is off), unknown `params` members ignored,
+  legacy forms and success bodies unchanged, legacy error texts as for the order-management methods (no inner
+  trace tokens). `get_trade_fee` stays legacy-only: the reference documentation marks it
+  deprecated in favor of the versioned `trade_preimage`. Detail: PR #372; CRD ch.43 §43.1R.
+
+#### Solana coins
+
+- **Solana entries of a coins file in the form GLEEC KDF uses can be read.** Besides its own
+  forms, KDF Reloaded now reads, in native builds, a Solana platform entry with
+  `"protocol_data": {}` and an SPL token entry of type `SOLANATOKEN` with `platform`, `decimals`, `mint_address` and `program_id`. A
+  `mint_address` or `program_id` that is not a valid public key makes the entry unreadable, and the
+  activation reports a protocol parse error. Solana stays switched off in this build, so no Solana
+  coin can be activated yet. Detail: PR #361; CRD ch.40 R40.1.2, R40.1.3.
+
+#### Tendermint (Cosmos) coins
+
+- **A Tendermint coin now has a transaction history.** `tx_history: true` on a Tendermint platform
+  coin starts reading the account's transactions from a node in the background, and `my_tx_history`
+  (the mmrpc-2.0 method) lists them for the coin and for its tokens: plain sends, token sends,
+  IBC transfers, HTLC creations and claims, delegations, undelegations and reward claims, each with
+  its amounts, fee and memo, and the fee of a token send as a row of the platform coin. While the
+  first read of the chain runs, the history state is `InProgress` with the number of transactions
+  left; it is `Finished` afterwards. A fee-only transaction counts its fee once, a reward claim
+  counts the fee it cost, a transaction touching several validators gets one row per validator, and
+  `tx_hex` is the signed transaction. The history of a refunded HTLC or a completed undelegation has
+  no row, because the chain records no transaction for them. The history of a custom token that is
+  not in the coins file is absent in 0.5.0. A history store written by this node is listed by the other
+  implementation too (checked against a reference release build on 2026-11-15); in this change only
+  Tendermint coins write the index that makes this work. A history database is per coin and shared by
+  every account activated on it, so rows of an earlier account stay and are listed under their own
+  addresses (a known property of the shared database, the same as at GLEEC KDF). A transaction whose
+  block time no node can give is read again by the next pass. Native only in 0.5.0: the
+  browser build has no versioned history store for any coin family. Detail: PR #363;
+  CRD ch.36 §36.14.1; §36.14.7.
+
+### Changed
+
+#### Shielded coins
+
+- **The shielded coin's library stack now also builds with Orchard scanning enabled; no behavior
+  change.** The way the transaction builder is asked for an output-only Ironwood bundle no longer
+  changes a public type that the Zcash wallet library constructs itself, which kept that library from
+  compiling with its Orchard feature on. Transactions are built exactly as before.
+  Detail: PR #375; CRD ch.39 status note of 2026-11-15, ch.34 ledger entry of 2026-11-15.
+
+#### Tendermint (Cosmos) coins
+
+- **Tendermint activation refuses a hardware key policy instead of ignoring it.** A request that
+  names the `Trezor` key policy used to activate the coin with the local key without a word; it now
+  fails before any node is contacted, with a `PlatformCoinCreationError` that says the hardware key
+  policy is not supported for Tendermint coins and to activate with the local key. An absent
+  `priv_key_policy`, `ContextPrivKey` and `IguanaPrivKey` activate as before. Any other value, such
+  as the WalletConnect form, fails request parsing with `InvalidRequest` (HTTP 400) instead of
+  activating with the local key. Detail: PR #358; CRD ch.36 §36.7, status note of 2026-11-15
+
+#### Solana coins
+
+- **Solana activation errors follow the shapes GLEEC KDF uses, and a token address is checked when
+  its coins entry is parsed.** On `enable_solana_with_tokens` a failed block-height or balance read
+  is now `PlatformCoinCreationError` with the platform ticker instead of `Internal`, and on
+  `enable_spl` a node failure stays `Transport`. An SPL token entry whose `token_contract_address`
+  is not a valid public key is now `TokenProtocolParseError` instead of `Internal`. The Solana
+  platform always counts 9 decimals; a `decimals` value in its coins entry is ignored, and a token
+  takes its decimals from `protocol_data` only. Solana stays switched off in this build. Detail:
+  PR #371; CRD ch.40 §40.3A, R40.6B.2.
+
+### Fixed
+
+#### Browser (WASM) build
+
+- **The browser demo page loads the current WASM build again.** The page `wasm_build/index.html`
+  imported a module file name (`mm2.js`) that the build no longer produces, so it could not start;
+  it now imports `kdflib.js`. The build guide and the page's README name the files the build writes,
+  and the build output directory `wasm_build/deps/` is ignored by git. Detail: PR #374; CRD ch.2 directory table (lists `wasm_build/`).
+
+#### Electrum servers
+
+- **An Electrum server is no longer marked as stuck just because the next block was slow.** A
+  server counted as stuck when it had sent no new block for a while (at least 10 minutes) while
+  another server had. After any long gap between blocks, every server except the first one to
+  report the new block was therefore marked stuck for about a second, which also demoted it and
+  started a new measurement of the servers. In a 72-hour run with four nodes, 405 of 411 such marks
+  cleared within one second. A server now counts as stuck only when another server has reported a
+  block this one has not, for longer than two block intervals and at least 180 seconds (10 minutes
+  for a coin without a block time in its coins entry). A server that keeps sending notifications
+  without reaching that block now counts as stuck too. A coin with a single connected server keeps
+  the old rule. Detail: PR #378; CRD ch.38 R38.6.4o item 4.
+
+#### Transaction history
+
+- **`my_tx_history` pages a stored history with the right totals.** For a coin whose history is
+  served from the store (BCH and SLP tokens, and now Tendermint coins), the versioned method
+  reported the page size as `total`, and a request with `from_id` could return an empty page; it now
+  returns the store's total, the right `skipped` count and `total_pages`. Detail: PR #363; CRD ch.53
+  R53.2.4, R53.2.8.
+
+#### QTUM and QRC20
+
+- **A QTUM delegation is no longer built at the same time as a withdraw.** Building a delegation
+  (`add_delegation`) asked for the lock that lets only one transaction from the wallet be built at
+  a time but did not wait for it, so the lock was never held, and removing one
+  (`remove_delegation`) did not ask for it at all. A delegation and a withdraw started together
+  could therefore be built at the same time. Both delegation calls now wait for the lock, as a
+  withdraw does, so the builds no longer overlap; as with two withdraws, a transaction that is built
+  but not yet broadcast does not keep a later build from choosing the same coins. Detail: PR #354; CRD ch.38 R38.5B.5.
+- **QTUM and QRC20 unspent lists and sends now go to the same first Electrum server.** With read
+  spreading on (the default), a list of the wallet's unspent QTUM coins could be answered by a server
+  that had not yet seen a transaction this node had just sent from a QRC20 token, and the node keeps
+  no record of what such a transaction spent. The next send could then choose a coin that is already
+  spent and be rejected. QTUM and each token also rank the servers separately. For QTUM and its
+  tokens, the unspent list no longer takes turns, and the list and every send now go to the servers
+  in the order of the coin's server list (servers that are behind come last), whatever
+  `electrum_server_order` says, so they start at the same server. Their other reads still take turns,
+  and other coins are unchanged. This narrows the gap and does not close it: a server can still
+  answer before it has seen the send, and a token that lists other servers than QTUM does not share
+  its first server. A shared connection and a shared record of spent coins for QTUM and its tokens
+  are planned. Detail: PR #368; CRD ch.38 R38.6.4a.
+
+### Tests
+
+- **The browser tests run again locally.** `wasm-pack test --firefox --headless mm2src/<crate>` finds and
+  runs the tests of the browser build again; before, the test runner found none ("no tests to run!"),
+  because the locked test library was far older than the locked `wasm-bindgen`. The test library is
+  updated to the matching release and the runner name in `.cargo/config.toml` is the standard one. This also
+  updates `wasm-bindgen-futures`, which the browser build uses at run time, to 0.4.67. No CI job runs the
+  browser tests yet. Detail: PR #373.
+- **The Tendermint unit tests of `coins` now run in CI.** A new CI job runs the Tendermint swap-flow,
+  priority-fee and WalletConnect signer tests and the postponed-family switch tests; the loopback
+  tests of the native RPC server join the maker-outbox job.
+- **The Electrum connection-pool tests and the offline QRC20 tests now run in CI.** No CI job ran them
+  before. A new job runs 203 tests: those of the Electrum client, pool and measurement modules and
+  the offline QRC20 tests (about 10 s of test time); 32 more need public servers and are skipped. Five QRC20 tests that turned out to need a public
+  testnet server are now marked as such and are skipped without network access, like other tests
+  that need public servers. The QTUM regtest image of the docker tests is now pinned to a fixed
+  version, so a re-published image cannot change what the tests run against. The three docker tests
+  that withdraw on public testnet servers no longer fail when two of those servers briefly disagree
+  about the chain: they turn the server height checks off, which they do not test. Detail: PR #377.
+
+### Plans touched
+
+- [`browser-build-gaps`](docs/plans/browser-build-gaps.md) — new, planning: the gaps of the browser (WASM)
+  build outside the shielded coins — versioned history, wallet management, event delivery to the page and
+  smaller items — in order of cost, and the limits a browser has by nature, also listed in
+  `docs/WASM_BUILD.md`.
+- [`mmrpc-v2-completion`](docs/plans/mmrpc-v2-completion.md) — in progress (0.5.0): phase 1 (order
+  management) implemented in PR #359, phase 2 (trading) in PR #372; decisions D1–D10 recorded; phases 3–5 open.
+- [`qtum-qrc20-stabilization`](docs/plans/qtum-qrc20-stabilization.md) — in progress (was parked):
+  checked against the code on 2026-11-15: phases A–F not started; the state found and the order of the work packages are in its
+  new section "State check (2026-11-15)".
+- [`rpc-error-redesign`](docs/plans/rpc-error-redesign.md) — new, planning, no schedule: one error vocabulary
+  (token spelling, payload kind, HTTP status) for the whole versioned RPC surface, with a compatibility period;
+  ordered 2026-11-15, written in PR #359.
+- [`shielded-coins-in-browser`](docs/plans/shielded-coins-in-browser.md) — new, planning: work packages to
+  activate shielded coins (ARRR) in the browser build — the wallet database on the SQLite route, one
+  parameter source for both targets, the gRPC-web transport, Worker hosting of wallet and prover, swaps
+  last — with the decisions of CRD ch.39 D39.6.6.a–i as proposals.
+- [`solana-sdk-upgrade`](docs/plans/solana-sdk-upgrade.md) — parked: the upstream `ed25519-dalek`
+  pin is gone on the Solana 3.x crates; the move is package S5 of `solana-support`, in this cycle.
+- [`solana-support`](docs/plans/solana-support.md) — in progress: checked against the code, gaps
+  corrected, packages S0 to S11 in a new order, the maintainer decisions of 2026-11-15 recorded;
+  packages S0 and S2 done in PR #361, S1 in PR #371.
+- [`startup-clock-check`](docs/plans/startup-clock-check.md) — new, planning: the clock check against
+  NTP time servers, implemented in PR #348; the open points O9 and O10 stay open.
+- [`tendermint-activation-features`](docs/plans/tendermint-activation-features.md) — item 4, the
+  Tendermint transaction history, is built in PR #363.
+
+## [0.4.0-beta.1] — 2026-11-14
+
 Within each heading, entries are grouped by area. Each entry ends with the pull request that made
 it and, where one exists, the CRD rule, for readers who want more.
 
@@ -51,6 +250,10 @@ The most important changes of this release in short. Each item points to the det
   PRs #268, #271, #277, #288.
 - **SLP withdrawals no longer give BCH to the miner (unit tests), and BCA HTLC spends and refunds can
   be built.** PRs #220, #221, #236.
+- **A maker whose claim of the taker payment was mined no longer refunds its own payment, and a
+  maker whose claim was lost can recover its payment once the taker has refunded.** PRs #344, #345,
+  #347.
+- **ARRR activates on Windows when the user profile path has non-ASCII characters.** PR #346.
 
 #### Warnings and gaps
 
@@ -258,8 +461,8 @@ A login without `enable_hd` is not affected. Detail: PR #319; CRD ch.36 R36.1.2,
   with an error naming the key, a hardware wallet
   refuses to sign for such a coin, and a BC2 entry without the key logs one warning that the network
   will refuse its transactions. The optional key `sighash_suffix_height` is checked but not used yet.
-  The shared coins list still has to carry the key on the `BC2` and `BC2-segwit` entries (see Known
-  limitations). Detail: PRs #261, #264; CRD ch.61.
+  The shared coins repository carries the key on the `BC2` and `BC2-segwit` entries since 2026-11-14
+  (see Known limitations). Detail: PRs #261, #264; CRD ch.61.
 - **A swap of a coin with a sighash suffix now starts only with a counterparty that signs with it.**
   **BC2 trading in KDF Reloaded is incompatible with other Komodo DeFi Framework implementations:**
   they cannot spend BC2 since block 57,750, and KDF Reloaded declines a BC2 swap with them before it
@@ -484,6 +687,17 @@ A login without `enable_hd` is not affected. Detail: PR #319; CRD ch.36 R36.1.2,
 
 #### UTXO coins and Electrum
 
+- **`mixed` is now the default Electrum server order.** When `electrum_server_order` is not set in
+  `MM2.json`, or is set to a value the node does not recognize, the node now ranks a coin's Electrum
+  servers by what it measures instead of drawing one random order at activation: it times each
+  server's answer to a small header request and checks that the server is up to date with the chain,
+  then draws the order with a weight that favors the faster up-to-date servers, half of each weight
+  staying uniform so that nodes do not all pick the same server. A maintained server that falls
+  behind or turns slow is replaced by another listed server, at most once per 5 minutes, and the
+  node logs the replacement, with its reason when it has one. To keep the previous behavior, set `electrum_server_order` to `random`; for the
+  behavior of GLEEC KDF, which keeps the listed order, set it to `listed`. Detail: PR #349; CRD
+  ch.38 R38.6.4b-R, R38.6.4l.
+
 - **A coin whose Electrum servers disagree about the chain now fails to activate, and later refuses
   new trades.** A server that is far ahead of the rest is not simply wrong: it can be the one that
   followed a network upgrade while the others stopped. The node cannot tell which side is right, so
@@ -526,10 +740,9 @@ A login without `enable_hd` is not affected. Detail: PR #319; CRD ch.36 R36.1.2,
   minutes, so a halted chain does not make every node probe the public servers every five minutes,
   and a search for a replacement connects at most four servers at a time. For the old behavior, set
   the `MM2.json` boolean `electrum_tip_checks` to `false` (and `electrum_server_order` to `listed`
-  and `electrum_spread_reads` to `false` to match GLEEC KDF). **`mixed` does not become the default
-  yet.** The change is in two stages: this release brings the checks; the default order changes from
-  `random` to `mixed` in a later release, after a field run on RIN, DGB and a coin with 600-second
-  blocks has shown no false marks. Detail: PR #324; CRD ch.38 R38.6.4o.
+  and `electrum_spread_reads` to `false` to match GLEEC KDF). The default server order is now
+  `mixed`; see the entry "`mixed` is now the default Electrum server order" below. Detail: PR #324;
+  CRD ch.38 R38.6.4o.
 - **`fetch_utxos`, `consolidate_utxos` and the automatic merge (`utxo_merge_params`) now work
   under an HD login**, as they do in GLEEC KDF. Until now the two commands were refused and the
   automatic merge stayed off.
@@ -858,7 +1071,7 @@ A login without `enable_hd` is not affected. Detail: PR #319; CRD ch.36 R36.1.2,
   accepted. The node used to discard the answer and log only the identifier it computed from the
   bytes. It now logs both in one `info` line, and writes a `warning` when they differ. The identifier
   the node returns to the caller is still the locally computed one. The lines name no server.
-  Detail: CRD ch.39, status note of 2026-11-12 after R39.11.30.
+  Detail: PR #345; CRD ch.39, status note of 2026-11-12 after R39.11.30.
 
 - **The node no longer sends a shielded transaction again that is already mined.** Before a
   light-mode broadcast it looks the transaction id up in the wallet database. A transaction the
@@ -1068,7 +1281,7 @@ A login without `enable_hd` is not affected. Detail: PR #319; CRD ch.36 R36.1.2,
   refund is held and the search repeated until the refund deadline; the swap then ends with a failed
   refund whose text says the state of the taker payment could not be determined on that coin (or
   that the claim is found but not confirmed), and manual recovery applies. Swaps that never reached
-  the claim are unchanged. Detail: CRD ch.51 R82.
+  the claim are unchanged. Detail: PR #344; CRD ch.51 R82.
 - **A maker whose claim of the taker payment was lost, and whose taker then refunded, can now
   recover its own payment with `recover_funds_of_swap`.** Before, the call refused, because the
   record holds the sent claim and the maker payment was taken to belong to the taker, although the
@@ -1079,14 +1292,14 @@ A login without `enable_hd` is not affected. Detail: PR #319; CRD ch.36 R36.1.2,
   not confirmed, or the chain cannot be read, or a found refund has no confirmation, it refuses and
   says so. When nothing spent the taker payment yet, it refuses and says to repeat the call once
   the taker has refunded. A refusal builds nothing and writes nothing. A completed swap is refused
-  as before. The automatic refund of the run loop is unchanged. Detail: CRD ch.51 R83.
+  as before. The automatic refund of the run loop is unchanged. Detail: PR #345; CRD ch.51 R83.
 - **Manual recovery of a maker swap whose claim call failed now looks at the taker payment first.**
   Before, `recover_funds_of_swap` refunded the maker payment after the refund time without looking at
   the taker coin's chain, although the claim may have been mined. Now a claim that is found on the
   chain and confirmed refuses the refund. A claim that is found but not confirmed, or a chain that
   cannot be read, refuses and says so. When the taker's refund is found, or nothing spent the taker
   payment, the refund goes on as before. A refusal builds nothing and writes nothing. The automatic
-  refund of the run loop is unchanged. Detail: CRD ch.51 R84.
+  refund of the run loop is unchanged. Detail: PR #347; CRD ch.51 R84.
 
 #### UTXO coins and Electrum
 
@@ -1360,7 +1573,8 @@ file carries the detail. "New" means the plan was created in this cycle.
   live chain a withdrawal and a swap between two KDF Reloaded nodes passed, and the decline of a
   counterparty that does not sign with the suffix was checked (release tests, "BC2 confirmation" and
   "BC2 swap check"). The KDF Reloaded coins file carries the `BC2` and `BC2-segwit` entries since
-  2026-11-10; the shared coins list and the P2PKH live check are open.
+  2026-11-10, and the shared coins repository carries the key on both since 2026-11-14; the P2PKH
+  live check is open.
 - [`arrr-htlc-lightwalletd-txwalk`](docs/plans/arrr-htlc-lightwalletd-txwalk.md) — planning: its target now reads "after the 0.4.0 beta".
 - [`arrr-ironwood-compatibility`](docs/plans/arrr-ironwood-compatibility.md) — done: the field tests of 2026-10-26 to
   2026-10-29 are recorded, and the two open items of the earlier deadline are closed as history.
@@ -1385,9 +1599,12 @@ file carries the detail. "New" means the plan was created in this cycle.
 - [`crate-versioning`](docs/plans/crate-versioning.md) — new, planning: the start-up banner now shows
   the version of the release package (PR #210); where that version should live, and whether the
   `version` call and swap records should carry it, are listed as open questions for the next round.
-- [`electrum-measured-server-order`](docs/plans/electrum-measured-server-order.md) — parked: shipped in PR #144; the lab rows
-  of 2026-11-06 that ran `mixed` and `measured` on RIN are recorded as input; the default stays
-  `random` until the decision on `mixed`.
+- [`electrum-measured-server-order`](docs/plans/electrum-measured-server-order.md) — done: shipped in PR #144; the lab rows
+  of 2026-11-06 that ran `mixed` and `measured` on RIN are recorded as input; `mixed` is the default
+  since 2026-11-14 (PR #349).
+- [`electrum-server-staleness`](docs/plans/electrum-server-staleness.md) — new, done: the Electrum
+  staleness checks and the activation-stall fix shipped in PR #324, the fixes of the chain comparison
+  in PR #339, and step 6, the `mixed` default, in PR #349.
 - [`electrum-tls-server-authentication`](docs/plans/electrum-tls-server-authentication.md) — new,
   parked: what an `SSL` Electrum server must present, with and without `disable_cert_verification`,
   is now written down (PR #240). So are a warning at activation when the flag is set and an optional
@@ -1477,6 +1694,10 @@ file carries the detail. "New" means the plan was created in this cycle.
   transaction sent (PR #239; see Known limitations).
 - [`solana-support`](docs/plans/solana-support.md) — parked: Solana stays switched off; the release it returns in is not
   set.
+- [`swap-transaction-path-hardening`](docs/plans/swap-transaction-path-hardening.md) — planning,
+  after the 0.4.0 beta: the stub now also names five areas of the legacy swap process for all coin
+  families: refund and recovery decisions, the follow-up of sent transactions, the durability of
+  swap records, the recognition of the counterparty's transactions and of the secret, and admission.
 - [`tendermint-activation-features`](docs/plans/tendermint-activation-features.md) — parked: Tendermint swaps were added to the
   0.4.0 scope on 2026-11-08 and put aside again on 2026-11-10 by the maintainer's decision; the
   coins stay wallet-only. Accepting both forms of the activation parameters is decided and not
@@ -1713,17 +1934,16 @@ lives.
   §39.6.5.
 - **The Komodo DeFi Framework and GLEEC KDF builds available in November 2026 cannot spend BC2
   (Bitcoin II).** Since block 57,750 the BC2 network rejects every spend signed without the chain's
-  sighash suffix, and those builds do not sign with it, so they can neither withdraw BC2 nor complete
-  a BC2 swap with any counterparty. KDF Reloaded declines a BC2 swap with such a node before it
-  starts, and signs with the suffix (PR #264), but only for a coin entry that carries
-  `"sighash_suffix": "0x01324342"`; until the shared coins list has the key on the `BC2` and
-  `BC2-segwit` entries, a BC2 withdrawal or swap payment is refused at broadcast ("Signature must be
-  zero for failed CHECK(MULTI)SIG operation"), and the node logs a warning when BC2 activates
-  without the key. A hardware wallet cannot sign this digest, so BC2 cannot
-  be used with one. The optional key `sighash_suffix_height` is checked but not used yet. The global
-  coins repository may not carry the key yet: add `sighash_suffix` (`"0x01324342"` on `BC2` and
-  `BC2-segwit`) to your coins file or use the KDF Reloaded coins file. Detail: PRs #261, #264; CRD
-  ch.61; issue #252.
+  sighash suffix, and those builds do not sign with it, so they can neither withdraw BC2 nor
+  complete a BC2 swap with any counterparty. KDF Reloaded declines a BC2 swap with such a node
+  before it starts, and signs with the suffix (PR #264), but only for a coin entry that carries
+  `"sighash_suffix": "0x01324342"`; for an entry without the key, a BC2 withdrawal or swap payment
+  is refused at broadcast ("Signature must be zero for failed CHECK(MULTI)SIG operation"), and the
+  node logs a warning when BC2 activates without the key. A hardware wallet cannot sign this digest,
+  so BC2 cannot be used with one. The optional key `sighash_suffix_height` is checked but not used
+  yet. The shared coins repository carries the key on `BC2` and `BC2-segwit` since 2026-11-14; a
+  coins file from before that date needs `sighash_suffix` (`"0x01324342"`) added to both entries, or
+  use the KDF Reloaded coins file. Detail: PRs #261, #264; CRD ch.61; issue #252.
 - **A browser (WASM) build cannot pin an Electrum server's key.** It removes a server entry that
   carries `spki_sha256` and uses the coin's other servers. Wallets and the shared coins file may not
   pass `spki_sha256` through to activation yet. Detail: PRs #240, #273; CRD ch.38 R38.6.4n,
@@ -1815,12 +2035,12 @@ lives.
   wait loop (taker-payment validation, the spend) fails the swap into its refund path. For an EVM
   coin used for making orders, configure at least one node with its own request allowance. Detail:
   CRD ch.35 R35.1.8, R35.1.11.
-- **A maker payment is not refunded after the spend of the taker payment was sent, even if that spend
-  never confirms.** If the node's spend of the taker payment was broadcast but dropped from the chain,
-  and the other side refunded its payment, `recover_funds_of_swap` refuses to refund the maker payment:
-  the other side knows the secret from the broadcast and can still claim it. A refund in that case only,
-  when the other side's refund is shown on its own chain, is under consideration. Detail: PRs #276,
-  #284; CRD ch.51 R75, D8.
+- **A maker payment is not refunded after the spend of the taker payment was sent, until the other
+  side's refund is shown.** If the node's spend of the taker payment was broadcast but dropped from
+  the chain, `recover_funds_of_swap` refuses to refund the maker payment while the other side's
+  payment is not refunded: the other side knows the secret from the broadcast and can still claim it.
+  Once the other side's refund is on its own chain with a confirmation, the call refunds the maker
+  payment (Fixed). Detail: PRs #276, #284, #345; CRD ch.51 R75, R83, D8.
 
 ## [0.3.0-beta.1] — 2026-11-01
 
