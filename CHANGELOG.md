@@ -47,11 +47,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **The wallet and coin methods `my_balance`, `disable_coin`, `send_raw_transaction`, `validateaddress`,
   `convertaddress`, `convert_utxo_address`, `kmd_rewards_info`, `coins_needed_for_kick_start`,
   `set_required_confirmations` and `set_requires_notarization` accept `mmrpc: "2.0"` requests**, in the same
-  way as the order and trading methods above. Their typed errors follow the documented statuses of the versioned
-  `withdraw`: an unknown coin answers `NoSuchCoin` with HTTP 404, a node or network failure `Transport` with 502, a request the client
+  way as the order and trading methods above. Their typed errors follow the versioned `withdraw` as the reference
+  answers it: an unknown coin answers `NoSuchCoin` with HTTP 404, a node or network failure `Transport` with 502, a request the client
   got wrong 400. `disable_coin` names the swaps or orders that block the deactivation inside `error_data`.
   Legacy forms and success bodies unchanged, legacy error texts as above (no inner trace tokens). Detail:
   PR #379; CRD ch.43 §43.1R.
+- **The remaining legacy-only methods accept `mmrpc: "2.0"` requests**: `all_swaps_uuids_by_filter`, `import_swaps`,
+  `version`, `stop`, `metrics`, `get_my_peer_id`, `get_directly_connected_peers`, `get_gossip_mesh`,
+  `get_gossip_peer_topics`, `get_gossip_topic_peers`, `get_relay_mesh`, `ban_pubkey`, `list_banned_pubkeys` and
+  `unban_pubkeys`, in the same way as the methods above. With this, every method that only the legacy surface knew
+  has a versioned form, except `recover_funds_of_swap` (waits for the swap architecture decisions),
+  `stats_swap_status`, `get_trade_fee`, `electrum`, `enable`, `help` and `show_priv_key`, which stay legacy-only on
+  purpose, and the test-only `sim_panic`. Detail: PR #387; CRD ch.43 §43.1R.
 
 #### Solana coins
 
@@ -82,8 +89,50 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   block time no node can give is read again by the next pass. Native only in 0.5.0: the
   browser build has no versioned history store for any coin family. Detail: PR #363;
   CRD ch.36 §36.14.1; §36.14.7.
+- **A Tendermint coin can be activated from a public key (watch-only).** `activation_params` of
+  `enable_tendermint_with_assets` (and the task form) now accepts `{"type": "WithPubkey", "params":
+  {"pubkey": {"type": "secp256k1" | "ed25519", "value": [bytes]}, "is_ledger_connection": bool}}`. The
+  coin's address is the account of that key (an `ed25519` key by the public Cosmos SDK rule for that
+  key type), and nothing is asked of a node or a wallet at activation. Such a coin holds no private
+  key: balances, the address and the history work as for any coin; `withdraw` and the delegation,
+  undelegation and reward-claim requests do not sign or send anything but answer an unsigned
+  document for the caller's own wallet to sign (no `tx_hex` and no `tx_hash`; a `sign_doc` with
+  `body_bytes`, `auth_info_bytes`, `chain_id` and `account_number`). With `is_ledger_connection: true`
+  a `withdraw` answers the Amino form instead (`legacy_amino_json` and `original_tx_type_url`) with
+  three times the computed fee (for the coin, not for a token), and the staking requests fail. A `memo` in the `withdraw` request is carried in the transaction: `memo` is now a typed member of every withdraw request: a `memo` that is not a string is refused as a malformed request for every coin (it was ignored before); only Tendermint coins and tokens read it. Placing an order with the coin or one
+  of its tokens, message signing, private-key display, and every swap payment, claim and refund are
+  refused (`PrivKeyNotAllowed::WatchOnlyCoin`). A malformed `activation_params` now fails request
+  parsing with `InvalidRequest`; the WalletConnect forms are still refused. Detail: PR #382; CRD ch.36
+  §36.14.3.
 
 ### Changed
+
+#### RPC interface
+
+- **A transport failure of `withdraw` answers HTTP 502 instead of 500.** The versioned `withdraw`, `withdraw_nft` and the
+  start of `task::withdraw::init` answer the error `Transport` (a node or server that does not answer, or answers
+  unusably) with status 502, as the reference does; the token and the body are unchanged. A client that treats
+  `withdraw` failures by status class now sees a network fault as 5xx gateway class rather than a server error.
+  Detail: PR #386; CRD ch.43 R43.1D.2, ch.49 status note.
+- **A refused legacy `disable_coin` always carries the lists a client may read.** When running swaps or orders
+  being matched block the deactivation, or the coin is not active, the error body carries `orders` (with
+  `matching` and `cancelled`), `active_swaps` and `swaps` (the same list as `active_swaps`), all present and
+  empty where nothing applies; before, each refusal carried one of them or none. The error text, HTTP 500 and the
+  cancel-first behavior are unchanged. Detail: PR #386; CRD ch.43 R43.1E.3, D43.1E.1 status note.
+- **Hardware-wallet failures of `withdraw` answer the one error `HwError`.** The versioned `withdraw`, `withdraw_nft`
+  and the start of `task::withdraw::init` no longer answer `TrezorDisconnected`, `NoTrezorDeviceAvailable`,
+  `FoundUnexpectedDevice` or `HardwareWalletInternal`. A device condition answers `error_type` `HwError` with
+  HTTP 410 and `error_data` naming the condition with the same words the activation methods use
+  (`NoTrezorDeviceAvailable`, `FoundMultipleDevices`, `FoundUnexpectedDevice`, `InvalidPin`, `ButtonExpected`,
+  `UserCancelled`, `InvalidSignature`, ...), so a client handles hardware failures of every method alike. A
+  connection timeout answers `Timeout` (408). Device failures that have no such word (transport, protocol,
+  invalid key data, internal) answer `InternalError` with HTTP 500, as before under the removed name. Detail:
+  PR #386; CRD ch.50 R50.17 status note, ch.43 R43.1D.2, ch.55 R55.2.17.
+- **The HD account methods answer hardware-wallet failures as `HwError` too.** `task::create_new_account` and the
+  other HD account methods no longer answer `TrezorDisconnected`, `NoTrezorDeviceAvailable`, `FoundUnexpectedDevice`
+  or `HardwareWalletInternal`; a device condition answers `HwError` (410) with the same words as above, and a
+  device that does not answer in time answers `Timeout` with HTTP 408 instead of 500. Device failures without a word
+  answer `Internal` (500). Detail: PR #386; CRD ch.05 §5.9B R35c.
 
 #### Shielded coins
 
@@ -126,6 +175,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 #### Browser (WASM) build
+
+- **A cancelled storage request no longer aborts other writes of the same transaction.** In the
+  browser build, if the task waiting for a storage request was cancelled before the request finished,
+  the browser later called a handler that no longer existed, which made the browser abort the whole
+  storage transaction, including other writes in it. The waiting code now withdraws its handlers when it
+  finishes or is cancelled, and a finished transaction withdraws its own. Detail: PR #376; CRD ch.26 R9A.
+
+- **Test code of the coin and node layers is no longer shipped in the browser build.** The browser test
+  modules of `coins` and of the node library (`mm2_main`), and the test helpers only they use, were
+  compiled into the browser build, and the browser test library was a normal dependency of eight crates.
+  They are now built only for tests, and the test library is a test-only dependency of `coins` and
+  `mm2_main` and no longer a dependency of the six crates that do not use it. The release browser bundle
+  (`kdflib_bg.wasm`) shrinks from 23,005,576 to 22,253,053 bytes. The browser tests of `coins` are the
+  same 24 as before, test for test (18 pass, 5 fail, 1 hangs, as before). The browser tests of `mm2_main`
+  and `mm2_gui_storage` did not compile before and do not compile now, with the same errors.
+  Detail: PR #391.
+
+- **Test code of the storage and network layers is no longer shipped in the browser build.** The browser
+  test modules of the storage layer (`mm2_db`) and the network layer (`mm2_net`) were compiled into the
+  browser build and into the test build of every crate that uses them, and the test library they use was
+  a normal dependency of `mm2_net` and `mm2_db`. They are now built only for tests, and the test library
+  is a test-only dependency of these two crates. The release browser bundle (`kdflib_bg.wasm`) shrinks from
+  23,196,199 to 22,963,595 bytes. The browser test run of `coins` now runs only the tests of `coins`. Detail: PR #389.
 
 - **The browser demo page loads the current WASM build again.** The page `wasm_build/index.html`
   imported a module file name (`mm2.js`) that the build no longer produces, so it could not start;
@@ -194,6 +266,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   updated to the matching release and the runner name in `.cargo/config.toml` is the standard one. This also
   updates `wasm-bindgen-futures`, which the browser build uses at run time, to 0.4.67. No CI job runs the
   browser tests yet. Detail: PR #373.
+- **The browser tests of `coins` now compile.** `wasm-pack test --firefox --headless mm2src/coins` stopped at
+  compile errors, because some test code that only works natively (tests written for the `tokio` runtime and the BCH
+  tests that use the SQLite history storage) was also built for the browser, and a test helper
+  was built natively only. The native-only tests are now left out of the browser test build and the
+  helper is built there too; only test code changed. The `coins` test build runs 44 browser tests: 24 of `coins` itself (18 pass, 5 fail, 1 hangs) and 20 that it
+  links in from `mm2_db` (16, all pass) and `mm2_net` (4: 3 pass, 1 fails), whose browser test modules are not limited
+  to test builds.
+  Three failures and the hanging test need a public node (an Ethereum node, two Electrum
+  servers, an SLP node). The other three failures are an NFT store test that hits a database
+  constraint error, an NFT store test that reads back nothing, and the linked-in WebSocket test of `mm2_net`
+  that expects an error for an invalid address. The hanging test stops the whole run, so it has to be skipped with
+  `-- --skip`. The failures are listed in `docs/DEV_ENVIRONMENT.md` and are not fixed here.
+  No CI job runs the browser tests yet. Detail: PR #388.
 - **The Tendermint unit tests of `coins` now run in CI.** A new CI job runs the Tendermint swap-flow,
   priority-fee and WalletConnect signer tests and the postponed-family switch tests; the loopback
   tests of the native RPC server join the maker-outbox job.
@@ -211,10 +296,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - [`browser-build-gaps`](docs/plans/browser-build-gaps.md) — new, planning: the gaps of the browser (WASM)
   build outside the shielded coins — versioned history, wallet management, event delivery to the page and
   smaller items — in order of cost, and the limits a browser has by nature, also listed in
-  `docs/WASM_BUILD.md`.
+  `docs/WASM_BUILD.md`. It now also lists the browser tests and lint (a CI job, the failing browser tests,
+  the browser-target lint) and the three probe fixes merged since it was written.
 - [`mmrpc-v2-completion`](docs/plans/mmrpc-v2-completion.md) — in progress (0.5.0): phase 1 (order
-  management) implemented in PR #359, phase 2 (trading) in PR #372, phase 3 (wallet and coins) in PR #379;
-  decisions D1–D10 recorded; phases 4–5 open.
+  management) implemented in PR #359, phase 2 (trading) in PR #372, phase 3 (wallet and coins) in PR #379,
+  phases 4 and 5 (swaps; daemon and network) in PR #387; decisions D1–D10 recorded; the extension is complete except
+  `recover_funds_of_swap`.
 - [`qtum-qrc20-stabilization`](docs/plans/qtum-qrc20-stabilization.md) — in progress (was parked):
   checked against the code on 2026-11-15: phases A–F not started; the state found and the order of the work packages are in its
   new section "State check (2026-11-15)".
