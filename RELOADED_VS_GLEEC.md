@@ -138,6 +138,33 @@ The developer-facing rule (mandatory for AI assistants, strong recommendation fo
   [Removed / disabled](#removed--disabled-in-kdf-reloaded)). CRD ch.40
   R40.1.2, R40.1.3; PR #361.
 
+- **Solana wallet methods answer.** On an active Solana coin or SPL token
+  GLEEC KDF ends many requests without a JSON answer (`sign_message`,
+  `verify_message`, `validateaddress`, `convertaddress`,
+  `get_raw_transaction`, the legacy `my_tx_history`,
+  `set_required_confirmations`, `show_priv_key` and others). Reloaded answers
+  each: with a result where the code exists, with an error naming the coin
+  otherwise. Message signing uses the message's bytes with no prefix and a
+  base58 signature; `show_priv_key` gives the 64-byte keypair in base58. The
+  minimum transaction amount of an SPL token is one smallest unit of its own
+  decimals, where GLEEC KDF states one lamport for every token; no peer sees
+  it while Solana cannot trade. No switch: an abnormal end cannot be a
+  compatibility target. CRD ch.40 D40.6B.1, R40.6B.14; PR #401.
+
+- **Solana under an HD login.** GLEEC KDF refuses Solana activation under a
+  global-HD login and derives no Solana key from a seed. Reloaded derives the
+  key from the seed phrase at `m/44'/501'/N'/0'` by default, or at
+  `m/44'/501'/N'` with the request member `"hd_path_layout": "bip44"`; nothing
+  is stored per wallet, so a client that used `"bip44"` must send it on every
+  activation. One seed phrase gives three Solana addresses (single-key, default
+  layout, `"bip44"`). `hd_path_layout`, `path_to_address` and `priv_key_policy`
+  are additional request members; a hardware-wallet policy is refused, and
+  `IguanaPrivKey` under an HD login gives the wallet's single internal key
+  and its address. No
+  switch: the reference behavior is a refusal, which cannot be a useful
+  compatibility target, and no peer sees which key a wallet uses. CRD ch.40
+  §40.1A; PR #392.
+
 - **Opt-in: an absent `max_eth_tx_type` read as unrestricted.** By default
   Reloaded reads a coin configuration with no `max_eth_tx_type` key as GLEEC KDF
   does: the coin may send untyped (legacy) transactions only, and an EIP-1559
@@ -610,6 +637,29 @@ These are divergences from GLEEC KDF that no compatibility switch reverses in th
   [`docs/GLEEC_COMPATIBILITY.md`](docs/GLEEC_COMPATIBILITY.md); CRD ch.36 R36.3.5, ch.18 R18.6B, ch.49 R49.28 to
   R49.30, ch.35 R35.6.8, R35.6.9. PR #323.
 
+- **The TRON node client (TRON is still switched off) gives each node a time limit, fails over on bad answers and
+  accepts request headers and an API key.** A TRON node that does not answer within 10 seconds is skipped, and so is a
+  node that answers with an error status, with something that is not the expected JSON, or with the node's own
+  error form; a rate-limit answer is never read as an empty account. The node that answers is asked first next time,
+  and several requests of one coin run at the same time. A signed transaction that a node rejects with a code ends the
+  request with that code. An entry of the TRON `urls` list may also be an object `{"url": "...", "headers": {...}}`
+  whose headers go to that node only, and the top-level `MM2.json` key `tron_api_key` is sent as `TRON-PRO-API-KEY`
+  to TronGrid hosts over HTTPS only. Both are Reloaded request extensions that a reference client never sends; no switch is
+  needed because a request without them is served as before. The values are secrets and are never logged or shown.
+  Row in [`docs/GLEEC_COMPATIBILITY.md`](docs/GLEEC_COMPATIBILITY.md); PR #394; CRD ch.21 §21.9 R-N3 to R-N9.
+
+- **TRON (still switched off) gets the standard platform-with-tokens activation route, and keeps the legacy one.**
+  `enable_eth_with_tokens`, `task::enable_eth::*`, `enable_erc20` and `task::enable_erc20::init` accept a TRX
+  platform and TRC20 tokens, as GLEEC KDF `v3.0.0-beta` serves them; Reloaded also keeps TRX and TRC20 on the legacy
+  `enable` and `electrum` methods, which GLEEC KDF refuses for them, as an extension a GLEEC client never reaches.
+  Where Reloaded differs from that reference, none of it needs a switch, and each is a row of
+  [`docs/GLEEC_COMPATIBILITY.md`](docs/GLEEC_COMPATIBILITY.md): swap-contract members may also be written as
+  base58check or `41...` hex on a TRON platform (a wider input; an EVM platform keeps `0x` only); the MetaMask
+  policy and `rpc_mode` are refused for TRON at activation (the reference activates an address its withdraw then
+  refuses); a global-HD login is refused for now, until the TRON HD wallet is built in the next change, except that `IguanaPrivKey` under an HD login is honored with the node's single internal key; and a key in the
+  query string of a node URL works. Entries of `nodes` may also carry a `headers` object and get `tron_api_key`.
+  CRD ch.21 §21.4, R21.10B.2, R21.10B.4, D21.B1, D21.B7, D21.10B.3.
+
 ### Removed / disabled in KDF Reloaded
 
 - iOS build target removed from the alpha release matrix.
@@ -622,7 +672,8 @@ These are divergences from GLEEC KDF that no compatibility switch reverses in th
   to return in the next beta. No switch exists: the build constants
   `TRON_ACTIVATION_AVAILABLE` and `SOLANA_ACTIVATION_AVAILABLE`
   (`coins/lp_coins_ops.rs`) are `false`. When TRON returns, Reloaded activates
-  TRX and TRC20 on the legacy methods as an extension. GLEEC KDF `v3.0.0-beta`
+  TRX and TRC20 on the legacy methods as an extension, and, since the route of
+  the entry above, on the platform-with-tokens activation too. GLEEC KDF `v3.0.0-beta`
   serves them only through the platform-with-tokens activation,
   `enable_eth_with_tokens` and the `task::enable_eth::*` family, and refuses
   them on the legacy methods, so a client written for GLEEC never sends such a
@@ -633,6 +684,16 @@ These are divergences from GLEEC KDF that no compatibility switch reverses in th
   with the local key. An absent value, `ContextPrivKey` and `IguanaPrivKey` activate as before. Any other value, such
   as the WalletConnect form (not built yet), fails request parsing with `InvalidRequest` (HTTP 400). No switch exists.
   CRD ch.36 §36.7. PR #358.
+- **A Tendermint activation under an HD login honors `priv_key_policy: IguanaPrivKey`.** GLEEC KDF accepts and ignores
+  `priv_key_policy` for Tendermint coins; Reloaded activates the coin with the single internal key of the node, as the
+  UTXO family does, and `path_to_address` then plays no part. An absent value and `ContextPrivKey` still use
+  the key at `path_to_address`. No switch exists. CRD ch.36 §36.7. PR #396.
+- **`priv_key_policy: IguanaPrivKey` under an HD login runs EVM coins, BCH with its tokens, Sia and Lightning on the node's
+  internal key.** This is a Reloaded decision; the reference behavior is not recorded in the CRD, and no parity is
+  claimed. Under a global-HD login `IguanaPrivKey` activates a single-address coin on the internal key (the HD context's
+  key at the node-key path), as Reloaded's UTXO family does; an absent value and `ContextPrivKey` keep today's behavior,
+  and an iguana login is unchanged. Lightning under this value is a separate identity with its own data directory.
+  No switch exists. CRD ch.05 R46, ch.35 R35.1.4, ch.51 R64, status notes of 2026-11-17.
 - **A Tendermint coin activated from a public key is watch-only, and its orders are refused.** The `WithPubkey` form
   of `activation_params` builds a coin that holds no private key: it answers `withdraw` and the staking requests with
   an unsigned document for the caller's own wallet (a `sign_doc`, or with `is_ledger_connection: true` the Amino form
@@ -986,6 +1047,38 @@ unchanged and activation returns a typed schema error; it is never silently
 deleted or treated as an empty wallet. Manual intervention is required only for
 that explicit unknown/corrupt-file error, not for ordinary switching between
 Reloaded and GLEEC KDF.
+
+#### Upgrade of a shielded wallet database and its backup
+
+When a new KDF Reloaded build needs a newer wallet-database schema than the one a
+`<TICKER>_RELOADED_WALLET.db` was created with, the first activation of that coin upgrades the
+file. Before it changes anything, the node:
+
+- checks that the disk holding the database has room for the backup and for the working copy:
+  twice the size of the wallet database plus 16 MiB. If not, the activation fails with an error that
+  gives the bytes needed and the bytes available, and no backup is written. Free some space and
+  activate again;
+- writes a consistent copy of the database next to it, named
+  `<TICKER>_RELOADED_WALLET.db.pre-upgrade.<milliseconds>.bak`, in the same data directory. It is
+  about as large as the wallet database;
+- checks the copy (SQLite integrity check, same table layout as the original). If the check fails,
+  the copy is deleted, the wallet database's content stays as it was, and the activation fails with an error
+  naming the check.
+
+The upgrade then runs on a second copy made from the verified backup, and replaces the wallet
+database only when the result checks out. If the upgrade itself fails, the original is set aside as
+`.upgrade-failed.<milliseconds>.bak` and a fresh wallet is scanned from the chain, as before.
+
+*Going back to an older KDF Reloaded build:* stop the node, copy the `.pre-upgrade.<milliseconds>.bak`
+file over `<TICKER>_RELOADED_WALLET.db`, delete `<TICKER>_RELOADED_WALLET.db-wal` and
+`<TICKER>_RELOADED_WALLET.db-shm` if they exist, and start the older build. The older build then
+sees the wallet as it was before the upgrade.
+
+*How many backups stay:* after a successful upgrade the node keeps only the newest
+`.pre-upgrade` backup of that wallet and deletes older ones. The top-level `MM2.json` key
+`shielded_db_upgrade_backups` (a whole number, default `1`, lowest effective value `1`) changes the
+number; the backup just made is always kept. Other `.bak` files, such as `.upgrade-failed` and
+`.legacy-v2`, are never deleted by the node.
 
 ## Forward-compatibility commitment
 

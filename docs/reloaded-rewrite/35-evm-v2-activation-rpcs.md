@@ -293,6 +293,17 @@ a sibling `params` object (G for the payload key; see erratum). A bare string
 Reloaded may additionally accept `Iguana` / `IguanaPrivKey` as aliases of
 `ContextPrivKey`.
 
+> *Status note added 2026-11-17 (Reloaded-original, clean side; the cleared text
+> above is unchanged; no forbidden-class input).* `IguanaPrivKey` (and its alias
+> `Iguana`) is no longer an alias of `ContextPrivKey` in Reloaded. Under a
+> global-HD login it activates a single-address coin on the daemon's internal key
+> (the HD context's key at the node-key path), in the single-address result
+> shape; `path_to_address`, `gap_limit`, `scan_policy` and `min_addresses_number`
+> are then ignored. Under an iguana login it equals `ContextPrivKey`. The bare
+> string spelling remains a request-parse failure, as the rule above says. The
+> reference's behavior for this value under HD is not recorded here; no parity is
+> claimed. See chapter 05 R46, status note of 2026-11-17.
+
 R35.1.4a `rpc_mode` selects the JSON-RPC transport. `Default` uses `nodes`.
 `Metamask` (WASM only) routes chain requests through the connected MetaMask
 provider. On WASM, `rpc_mode` and `priv_key_policy` shall be **both** MetaMask
@@ -447,6 +458,16 @@ version for all nodes" (public-docs citation; the message text is not bound).
 > 4. `contract_supports_watchers` is parsed only.
 > 5. Under MetaMask (WASM) chain requests still go to `nodes`, not through the
 >    provider.
+
+*Status note (2026-11-17), TRON platform (PR #405).* The `ticker` row's TRON
+platform protocol is now accepted on this route (`TRX` platform, `TRC20` tokens
+in `erc20_tokens_requests`; behind `TRON_ACTIVATION_AVAILABLE`, `false`, so the
+route answers the "not available" refusal for now). For a TRON platform the
+`nodes` list is HTTP(S) only; `komodo_proxy` is parsed and, as for item 3 above,
+does not sign requests; each entry also reads the optional `headers` object of
+chapter 21 R-N9 (the `tron_api_key` applies to its URL as well); and the
+swap-contract members take the base58check and hex forms of chapter 21 R21.B2
+besides the EVM `0x` form. Chapter 21 §21.4 and R21.10B.2 govern the rest.
 
 ---
 
@@ -886,6 +907,15 @@ not govern the RPC wire dump (`docs/DEV_BUILD.md` §4.1). The dump is a
 debugging build feature, off by default, and keeps its own secrets switch
 (`MM2_RPC_WIRE_DUMP_SECRETS`); what it redacts is that feature's own
 contract (maintainer decision 2026-10-26). No other output is exempt.
+
+*Wire dump, headers and API keys (status note 2026-11-17).* In the dump's
+redacted mode a member named `headers` (letter case ignored) is redacted as a
+whole, whatever it contains, and a member whose name contains `api-key` or
+`authorization` (letter case ignored) is redacted like the members whose names
+already contain `api_key`, `token` or `secret`. This covers the request headers
+and API key of a Tron node entry ([Chapter 21](21-tron-integration.md) R-N9).
+Nothing else of the dump changes, and `MM2_RPC_WIRE_DUMP_SECRETS=1` still shows
+everything. The sentences above are left as written.
 
 *URLs in the redacted wire dump (maintainer decision 2026-10-28, D35.10).* In
 the dump's redacted mode, the default whenever the dump is on, every URL with
