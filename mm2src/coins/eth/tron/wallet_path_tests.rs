@@ -8,7 +8,7 @@
 use super::test_node::{Reply, StubNode};
 use super::withdraw::withdraw_tron;
 use super::{tron_coin_from_conf_and_request, Network, TronAddress, TRX_DECIMALS};
-use crate::eth::{EthCoin, EthCoinType};
+use crate::eth::{EthCoin, EthCoinType, EvmWithdrawSender};
 use crate::{BalanceError, CoinProtocol, MarketCoinOps, MmCoin, MmCoinEnum, WithdrawError, WithdrawFee, WithdrawRequest};
 use bigdecimal::BigDecimal;
 use common::block_on;
@@ -18,7 +18,7 @@ use mm2_core::mm_ctx::{MmArc, MmCtxBuilder};
 use serde_json::json;
 use std::str::FromStr;
 
-const TRC20_CONTRACT: &str = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
+pub(super) const TRC20_CONTRACT: &str = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
 const TXID: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
 /// A stand-in for a signed protobuf transaction: the stub node never parses it.
 const TX_BYTES: [u8; 4] = [0x0a, 0x02, 0xab, 0xcd];
@@ -32,7 +32,7 @@ fn priv_key() -> [u8; 32] {
 }
 
 /// A TRX coin activated against `node_url`. The context is returned so that it outlives the coin's use.
-async fn trx_coin(node_url: &str) -> (MmArc, EthCoin) { trx_coin_over(&[node_url]).await }
+pub(super) async fn trx_coin(node_url: &str) -> (MmArc, EthCoin) { trx_coin_over(&[node_url]).await }
 
 /// A TRX coin activated against the nodes `node_urls`, in this order.
 async fn trx_coin_over(node_urls: &[&str]) -> (MmArc, EthCoin) {
@@ -47,7 +47,7 @@ async fn trx_coin_over(node_urls: &[&str]) -> (MmArc, EthCoin) {
 }
 
 /// A 6-decimal TRC20 coin activated against `node_url`.
-async fn trc20_coin(node_url: &str) -> (MmArc, EthCoin) {
+pub(super) async fn trc20_coin(node_url: &str) -> (MmArc, EthCoin) {
     let ctx = MmCtxBuilder::new().into_mm_arc();
     let req = json!({ "urls": [node_url] });
     let conf = json!({ "decimals": 6 });
@@ -627,6 +627,7 @@ fn my_tron_form() -> String {
 fn withdraw_request(coin: &EthCoin, fee: Option<WithdrawFee>) -> WithdrawRequest {
     WithdrawRequest {
         memo: None,
+        expiration_seconds: None,
         coin: coin.ticker.clone(),
         from: None,
         to: "TNPeeaaFB7K9cmo4uQpcU32zGK8G1NYqeL".to_owned(),
@@ -668,7 +669,7 @@ fn withdraw_with_any_fee_descriptor_is_refused_before_a_node_is_asked() {
             ];
             for fee in fees {
                 let req = withdraw_request(&coin, Some(fee));
-                match withdraw_tron(coin.clone(), req).await {
+                match withdraw_tron(coin.clone(), req, EvmWithdrawSender::activated(&coin)).await {
                     Err(e) => assert!(
                         matches!(e.get_inner(), WithdrawError::InvalidFeePolicy(_)),
                         "a fee descriptor must answer InvalidFeePolicy"
@@ -694,7 +695,12 @@ fn withdraw_without_a_fee_descriptor_still_reaches_the_node() {
             } else {
                 trx_coin(&node.url()).await
             };
-            withdraw_tron(coin.clone(), withdraw_request(&coin, None)).await
+            withdraw_tron(
+                coin.clone(),
+                withdraw_request(&coin, None),
+                EvmWithdrawSender::activated(&coin),
+            )
+            .await
         });
         // The stub refuses the endpoints after the balance read, so the withdraw ends in an error, but not the
         // fee-policy one, and only after the node was asked for the balance.
@@ -711,7 +717,7 @@ fn withdraw_without_a_fee_descriptor_still_reaches_the_node() {
     }
 }
 
-const NOW_BLOCK_BODY: &str = r#"{"blockID":"0000000003456789abcdef0123456789abcdef0123456789abcdef0123456789","block_header":{"raw_data":{"number":58251145,"txTrieRoot":"0000000000000000000000000000000000000000000000000000000000000000","witness_address":"41ab","parentHash":"0000000000000000000000000000000000000000000000000000000000000000","version":32,"timestamp":1700000000000},"witness_signature":"ab"},"transactions":[]}"#;
+pub(super) const NOW_BLOCK_BODY: &str = r#"{"blockID":"0000000003456789abcdef0123456789abcdef0123456789abcdef0123456789","block_header":{"raw_data":{"number":58251145,"txTrieRoot":"0000000000000000000000000000000000000000000000000000000000000000","witness_address":"41ab","parentHash":"0000000000000000000000000000000000000000000000000000000000000000","version":32,"timestamp":1700000000000},"witness_signature":"ab"},"transactions":[]}"#;
 
 /// A node that serves the withdraw's endpoints with the answer forms of the public node.
 fn withdraw_node() -> StubNode {
@@ -740,7 +746,12 @@ fn withdraw_gets_past_tapos_with_the_nodes_getnowblock_form() {
             } else {
                 trx_coin(&node.url()).await
             };
-            withdraw_tron(coin.clone(), withdraw_request(&coin, None)).await
+            withdraw_tron(
+                coin.clone(),
+                withdraw_request(&coin, None),
+                EvmWithdrawSender::activated(&coin),
+            )
+            .await
         });
         let details = result.unwrap_or_else(|e| panic!("the withdraw must succeed (trc20={trc20}): {e:?}"));
         assert!(!details.tx_hex.0.is_empty());
@@ -817,7 +828,12 @@ fn withdraw_balance_read_of_a_node_error_answer_is_an_error_not_zero() {
     let node = getaccount_node(200, NODE_ERROR_BODY);
     let result = block_on(async {
         let (_ctx, coin) = trx_coin(&node.url()).await;
-        withdraw_tron(coin.clone(), withdraw_request(&coin, None)).await
+        withdraw_tron(
+            coin.clone(),
+            withdraw_request(&coin, None),
+            EvmWithdrawSender::activated(&coin),
+        )
+        .await
     });
     match result {
         Err(e) => assert!(matches!(e.get_inner(), WithdrawError::Transport(_))),

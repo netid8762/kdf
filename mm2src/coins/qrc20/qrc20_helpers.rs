@@ -44,6 +44,8 @@ impl<'a> UtxoCoinBuilderCommonOps for Qrc20CoinBuilder<'a> {
 
     fn ticker(&self) -> &str { self.ticker }
 
+    fn shared_electrum_platform(&self) -> Option<&str> { Some(self.platform.as_str()) }
+
     async fn decimals(&self, rpc_client: &UtxoRpcClientEnum) -> UtxoCoinBuildResult<u8> {
         if let Some(d) = self.conf()["decimals"].as_u64() {
             return Ok(d as u8);
@@ -159,7 +161,11 @@ impl Qrc20Coin {
     /// `gas_fee` should be calculated by: gas_limit * gas_price * (count of contract calls),
     /// or should be sum of gas fee of all contract calls.
     pub async fn get_qrc20_tx_fee(&self, gas_fee: u64) -> Result<u64, String> {
-        Ok(try_s!(self.get_tx_fee().await).rate_per_kb() + gas_fee)
+        // A QRC20 coin has no ZIP 317 fee: the rule is for Zcash version 5 transparent transactions.
+        let rate_per_kb = try_s!(self.get_tx_fee().await)
+            .rate_per_kb()
+            .ok_or_else(|| ERRL!("QRC20 coins do not support the ZIP 317 fee rule"))?;
+        Ok(rate_per_kb + gas_fee)
     }
 
     /// Generate and send a transaction with the specified UTXO outputs.

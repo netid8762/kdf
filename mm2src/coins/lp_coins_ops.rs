@@ -192,9 +192,12 @@ pub async fn lp_coininit(ctx: &MmArc, ticker: &str, req: &Json) -> Result<MmCoin
         // TRON activation routes through a dedicated builder that populates
         // `EthCoin.tron_api`. P10.2 wiring.
         // Docs vs reference (CRD ch.55 R55.4.7, D55.5): the reference release rejects TRX and TRC20 on the
-        // legacy path and requires an mmrpc 2.0 activation. Reloaded has no mmrpc 2.0 TRON activation, so
-        // rejecting them here would remove TRON activation entirely; it keeps them as a documented extension
-        // (maintainer decision 2026-10-11). A client written for the reference never sends such a request.
+        // legacy path and requires an mmrpc 2.0 activation. Reloaded has that activation now
+        // (`enable_eth_with_tokens`, `task::enable_eth`), and builds the TRON HD wallet there under a global-HD
+        // login (CRD ch.21 R-A2). This legacy route stays as a documented extension (maintainer decision
+        // 2026-10-11). Under a global-HD login it keeps the node's internal key, as the EVM and UTXO legacy routes
+        // do in Reloaded (decided 2026-11-19), so its address differs from the one the mmrpc 2.0 HD route gives for
+        // the same seed. A client written for the reference never sends such a request.
         CoinProtocol::TRX { .. } | CoinProtocol::TRC20 { .. } => try_s!(
             crate::eth::tron::tron_coin_from_conf_and_request(ctx, ticker, &coins_en, req, &secret, protocol).await
         )
@@ -781,6 +784,16 @@ pub async fn disable_coin(ctx: &MmArc, ticker: &str) -> Result<(), String> {
             if let MmCoinEnum::Qrc20Coin(token) = &removed {
                 token.end_history_collector();
             }
+            // The disabled instance leaves the subscriptions of its Electrum client; one that no other instance
+            // remembers is no longer placed again after a reconnect (CRD ch.38 D38.6.4Q.1 status note, item 6). This
+            // takes no registry lock and sends nothing.
+            match &removed {
+                MmCoinEnum::QtumCoin(qtum) => {
+                    AsRef::<crate::utxo::UtxoCoinFields>::as_ref(qtum).forget_electrum_subscriptions()
+                },
+                MmCoinEnum::Qrc20Coin(token) => token.utxo.forget_electrum_subscriptions(),
+                _ => (),
+            }
             forget_token_records(&coins, &removed, ticker);
             Ok(())
         },
@@ -898,6 +911,28 @@ pub async fn register_balance_update_handler(
 ) {
     let coins_ctx = CoinsContext::from_ctx(&ctx).unwrap();
     coins_ctx.balance_update_handlers.lock().await.push(handler);
+}
+/// Registers the swap layer's reader of the saved swaps that are not finished, which the activation of a
+/// shielded coin checks its key against (CRD ch.39 R39.8.0bd). A second registration replaces the first.
+///
+/// # Errors
+///
+/// Returns the reason when the coins context cannot be created.
+pub fn register_unfinished_swaps_view(
+    ctx: &MmArc,
+    view: Arc<dyn crate::z_coin::UnfinishedSwapsView>,
+) -> Result<(), String> {
+    let coins_ctx = CoinsContext::from_ctx(ctx)?;
+    coins_ctx.set_unfinished_swaps_view(view);
+    Ok(())
+}
+/// Whether a reader of the unfinished swaps is registered in this context.
+///
+/// # Errors
+///
+/// Returns the reason when the coins context cannot be created.
+pub fn unfinished_swaps_view_registered(ctx: &MmArc) -> Result<bool, String> {
+    Ok(CoinsContext::from_ctx(ctx)?.has_unfinished_swaps_view())
 }
 pub fn update_coins_config(mut config: Json) -> Result<Json, String> {
     let coins = match config.as_array_mut() {
