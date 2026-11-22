@@ -129,8 +129,8 @@ The developer-facing rule (mandatory for AI assistants, strong recommendation fo
   and `init_trezor*` task aliases and the one-shot `enable_lightning` (all
   inherited from the GPLv2 baseline), the flat `init_lightning*` /
   `cancel_init_lightning` aliases (uniform with the other `init_<coin>*` names),
-  and its own Solana surface `enable_solana_with_tokens` / `enable_spl` (routed,
-  but refusing every request in this beta; see
+  and its own Solana surface `enable_solana_with_tokens` / `enable_spl`
+  (Solana is wallet-only; see
   [Removed / disabled](#removed--disabled-in-kdf-reloaded)). GLEEC
   KDF (`v2.6.0-beta` and `v3.0.0-beta`) routes none of them; clients written for
   GLEEC use the `task::` equivalents, which Reloaded also routes. The extra
@@ -144,9 +144,7 @@ The developer-facing rule (mandatory for AI assistants, strong recommendation fo
   `platform`, `decimals` and `token_contract_address`, which means the SPL
   Token program. The extra forms are additive and need no switch. Native and
   browser (WASM) builds read all of these (browser builds since PR #430).
-  Solana stays switched off in this beta (see
-  [Removed / disabled](#removed--disabled-in-kdf-reloaded)). CRD ch.40
-  R40.1.2, R40.1.3; PR #361.
+  CRD ch.40 R40.1.2, R40.1.3; PR #361.
 
 - **Solana compatibility activation methods.** `experimental::enable_solana_with_assets`
   and `experimental::enable_solana_token` take GLEEC KDF's requests and answer its results
@@ -155,7 +153,7 @@ The developer-facing rule (mandatory for AI assistants, strong recommendation fo
   activates the token with balance `"0"` (GLEEC KDF fails the activation); the platform
   method also takes `hd_path_layout`, `path_to_address` and `priv_key_policy`; an inline
   token `protocol` may also use Reloaded's `SPLTOKEN` form. Native and browser (WASM)
-  builds (browser builds since PR #430); Solana stays switched off in this beta. CRD ch.40 §40.2, §40.3, D40.6B.2; PR #426.
+  builds (browser builds since PR #430). CRD ch.40 §40.2, §40.3, D40.6B.2; PR #426.
 
 - **Solana node selection.** GLEEC KDF asks the nodes `getHealth` in list order before every
   request and uses the first healthy one. Reloaded draws a random node order once when the coin is
@@ -363,6 +361,7 @@ These are divergences from GLEEC KDF that no compatibility switch reverses in th
 - **`get_my_address` while a Trezor is initialized.** For an EVM coin that is not activated, KDF Reloaded derives the reported address from the login's key, also when a Trezor context exists. GLEEC KDF derives it from the device whenever a Trezor context exists. As on GLEEC KDF, each coin takes its keys and stores its accounts by its own key policy, and only a coin activated for the Trezor is refused key export. Two points still differ: a new address of a coin activated for the Trezor is not confirmed on the device, and the BCH activation task refuses the Trezor policy (CRD ch.05 §5.10B). Batch 4 item B4-2 (PR #293); CRD ch.05 §5.10B R57 and D7.e.
 - **A Trezor replaced while its coins are active.** A coin activated under the Trezor policy keeps the identity of the device it was activated with. After `task::init_trezor` puts a different device in the slot, the coin answers `FoundUnexpectedDevice` to `task::create_new_account`, `get_new_address` and a withdrawal before it asks the device or writes anything; it works again with its own device, or after it is activated anew with the other one. A swap, also one that was already running, keeps signing with the coin's own device and refuses any other. GLEEC KDF uses the new device's keys against the old device's accounts. The maintainer decided on 2026-11-08 that no switch restores it. Batch 4 item B4-14 (PR #302); CRD ch.05 §5.10B R58a and R58a.1. Code: `crypto/src/hw_ctx.rs` (`ensure_same_device`), `coins/hd_pubkey.rs`.
 - **A coin's `derivation_path` changed between sessions under an HD login.** Under an HD login with the seed as the key source, KDF Reloaded loads a coin's stored HD accounts only when each stored account key equals the key the seed derives for that account index below the coin's currently configured `derivation_path`; a stored account that differs is removed with one WARN and not loaded. After the coins file changes a coin's path, the coin therefore starts as a fresh HD wallet at the new path (the first account created and, by default, its addresses scanned up to the gap limit), and restoring the previous path brings the earlier addresses back the same way (the first account, or the one `path_to_address` names, scanned up to the gap limit; other accounts with `task::create_new_account`, addresses beyond the gap limit with `get_new_address`). No key material is lost in either implementation, since every address can be derived from the seed again at its path. GLEEC KDF loads stored accounts as stored: after a path change the earlier accounts and their addresses stay in use while the reported path is the new one. A coin activated under the Trezor policy loads its rows as stored. The WARN reads "…that the wallet's seed did not derive", which is inaccurate for this case. The maintainer decided on 2026-11-11 that this release documents it; a friendlier behavior is planned, see plan [`hd-account-storage-on-path-change`](docs/plans/hd-account-storage-on-path-change.md). The check came with batch 4 item B4-2 (PR #293); CRD ch.05 §5.10B, status note of 2026-11-11. Code: `coins/hd_wallet_storage/mod.rs` (`load_accounts_derived_from_seed`, `is_account_of_the_seed`), `coins/utxo/utxo_common/utxo_common_hd.rs` (`load_hd_accounts_from_storage`), `coins/eth/eth_activation.rs`.
+- **`page_balance` of a page that lists no address, and an HD account that knows no address.** `account_balance` of every HD coin answers `page_balance` as an object keyed by ticker, summed over the addresses of the returned page, as GLEEC KDF does. For a page that lists no address (past the known range), and for the `total_balance` of an account without a known address, KDF Reloaded answers one entry for the requested coin's ticker with a zero balance, where GLEEC KDF answers `{}`. Under the default `scan_policy`, KDF Reloaded also scans a stored account that has no known address at the next activation, for UTXO coins, QTUM, Sia and EVM coins including TRON; GLEEC KDF scans only a wallet that has no stored account, so an account left empty by a first activation that failed while scanning stays unscanned there. The maintainer decided on 2026-11-22 that no switch restores either behavior. CRD ch.49 R49.35 and R49.36 item 7, ch.38 R38.8.5, ch.05 R35a. Code: `coins/rpc_command/account_balance.rs`, `coins/coin_balance.rs` (`enable_hd_wallet`).
 - **Legacy `my_balance` and `get_enabled_coins` answer for an EVM coin under an HD login.** They report the activated address. GLEEC KDF fails both under an HD login, for EVM coins as for UTXO coins; for a UTXO coin KDF Reloaded fails them too. Code: `coins/eth/eth_market_ops.rs` (`my_address`), `coins/lp_coins_ops.rs` (`get_enabled_coins`). See CRD ch.05 §5.9B R35 and plan [`hd-key-unification`](docs/plans/hd-key-unification.md).
 - **A Light-mode ZHTLC coin is served by `lightwalletd`; Electrum is only a
   fallback for three swap questions, and there is no switch to restore the
@@ -794,7 +793,8 @@ These are divergences from GLEEC KDF that no compatibility switch reverses in th
 - **TRON has an HD wallet on the standard methods; the legacy route keeps the internal key.**
   Under a global-HD login `enable_eth_with_tokens` and `task::enable_eth::init` derive the TRX address under the
   `derivation_path` of the coin config (coin type 195), as GLEEC KDF does; the HD methods (`get_new_address`,
-  `account_balance` and the task forms of `get_new_address`, `scan_for_new_addresses` and `account_balance`) answer
+  `account_balance` and the task forms of `scan_for_new_addresses` and `account_balance`; this build has no task form
+  of `get_new_address`) answer
   base58check addresses and a balance map (over TRX and the enabled TRC20 tokens for the TRX ticker, that token only for
   a TRC20 ticker, as GLEEC KDF does), and `task::create_new_account::init` fails with `Internal`. An address counts as
   used when the chain has created its account or an enabled TRC20 token has a balance there. For a scan asked for a
@@ -866,17 +866,49 @@ These are divergences from GLEEC KDF that no compatibility switch reverses in th
   writes `null`: Reloaded omits an absent memo in every withdraw result outside the Tendermint family. A client that
   needs the selector has it in its own request. No peer sees the result, so no switch exists. CRD ch.63 §63.8A,
   D63.8.
+- **A swap database migrated beyond state 15 is refused at start-up.** When the highest migration state in `MM2.db` is
+  above the highest state the build knows (15 in both), KDF Reloaded stops at start-up with an error that names both
+  numbers. GLEEC KDF starts, changes nothing and uses the database as a state-15 database without a warning. No
+  released version of either records a state above 15; two unreleased reference development branches each record a
+  different state 16, so that value identifies no layout. The refusal is compatible with GLEEC KDF: a database KDF
+  Reloaded leaves at state 15 is fully migrated for both. No switch exists; row in
+  [`docs/GLEEC_COMPATIBILITY.md`](docs/GLEEC_COMPATIBILITY.md). CRD ch.44 R44.9A.1 to R44.9A.5.
+
+- **Saved swap and order records are synced to disk when they are replaced.** Both write a saved swap through a
+  temporary file and a rename. KDF Reloaded also forces the temporary file to disk before the rename and, on Unix,
+  the folder after it, uses a temporary name unique per write (`<file name>.<process id>.<counter>.tmp`) instead of
+  the fixed `<uuid>.json.tmp`, and writes saved orders the same way. Both ignore the other's leftover temporary
+  files. No peer sees it, so no switch exists; row in [`docs/GLEEC_COMPATIBILITY.md`](docs/GLEEC_COMPATIBILITY.md).
+  CRD ch.44 R44.9A.10 to R44.9A.13.
+
+- **A swap run that lost its swap lock stops.** Both keep a swap's lock in `<uuid>.lock` as a Unix time in seconds.
+  GLEEC KDF rewrites it in place and keeps running, refreshing and finally removing it even after another runner
+  took it over. KDF Reloaded replaces it in one step and checks before each refresh that it still holds its own
+  value; when it does not, the run is stopped where it stands and leaves the file, and the swap is handed to the
+  ordinary start of a saved swap, which resumes it if no other runner holds the lock after 40 seconds. The file's
+  content is the same in both, so each respects the other's lock by its timestamp. No peer sees it, so no switch
+  exists; row in [`docs/GLEEC_COMPATIBILITY.md`](docs/GLEEC_COMPATIBILITY.md). CRD ch.51 R5, ch.44 §44.9A.
 
 ### Removed / disabled in KDF Reloaded
 
 - iOS build target removed from the alpha release matrix.
-- **Solana (SOL, SPL tokens) is switched off in this beta.** Its support is
-  not finished, so Reloaded does not activate it at all: the legacy `enable` /
-  `electrum`, `enable_solana_with_tokens` and `enable_spl` answer "Solana
-  support is not available in this build". Nothing is registered and the rest
-  of the node is unaffected. Solana is planned to return in the next beta. No
-  switch exists: the build constant `SOLANA_ACTIVATION_AVAILABLE`
-  (`coins/lp_coins_ops.rs`) is `false`.
+- **Solana (SOL, SPL tokens) coins are wallet-only.** In 0.5.0 Solana can be
+  activated again (earlier releases refused it on every route): on Reloaded's
+  own `enable_solana_with_tokens` and `enable_spl`, and on
+  `experimental::enable_solana_with_assets` and
+  `experimental::enable_solana_token`, the methods GLEEC KDF `v3.0.0-beta`
+  serves, in native and browser (WASM) builds. The legacy `enable` /
+  `electrum` reject a Solana coin as one that needs an mmrpc 2.0 activation,
+  as GLEEC KDF does (CRD ch.55 R55.4.7). Activation, balances, `withdraw`,
+  message signing and `disable_coin` work. Orders and swaps do not: no GLEEC
+  KDF release has a Solana swap, and placing an order with a Solana coin
+  there ends abnormally (CRD ch.40 R40.6B.6, F40.6B.3). Reloaded
+  refuses `setprice`, `buy`, `sell` and `trade_preimage` for a pair with a
+  Solana coin or SPL token with "Trading is not supported for coin …", and
+  every swap operation of such a coin answers an error that names it (CRD
+  ch.60 R60.6.5). No switch exists: an abnormal end is no compatibility
+  target. There is no Solana transaction history yet, as in GLEEC KDF (CRD
+  ch.40 D40.1, D40.4).
 - **TRON (TRX, TRC20) coins are wallet-only.** Since 2026-11-20 TRON can be
   activated again (0.4.0 refused it on every route): on the
   platform-with-tokens activation, `enable_eth_with_tokens` and the
@@ -888,7 +920,8 @@ These are divergences from GLEEC KDF that no compatibility switch reverses in th
   Reloaded has no TRON swap, and neither has a GLEEC KDF release. `setprice`,
   `buy`, `sell` and `start_swap` refuse a TRON coin with the usual "… is wallet
   only" answer, a TRON coin declines to match, an order with a TRON coin
-  saved earlier is cancelled at startup, and an unfinished saved swap that names
+  saved earlier is kept at startup but never announced or matched, and an
+  unfinished saved swap that names
   a TRON coin is not resumed at startup (its record is kept, with a line in the
   log). This holds whatever the coins-file entry says. For an entry with
   `"wallet_only": true`, which every published TRON entry has, the answer is
@@ -997,8 +1030,8 @@ These are divergences from GLEEC KDF that no compatibility switch reverses in th
 - **Tendermint (Cosmos) coins and tokens are wallet-only in this beta.**
   Activation, balances and `withdraw` work; `setprice`, `buy`, `sell` and
   `start_swap` refuse the coin with the usual "… is wallet only" answer, and an
-  order with a Tendermint coin saved by an earlier version is cancelled at
-  startup. A swap already in progress still
+  order with a Tendermint coin saved by an earlier version is kept at
+  startup but never announced or matched. A swap already in progress still
   completes or is recovered. Orders and swaps are planned to return in a later
   release. No switch exists: the build constant `TENDERMINT_SWAPS_AVAILABLE`
   (`coins/lp_coins_ops.rs`) is `false`. When they return, three points will
