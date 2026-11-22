@@ -52,7 +52,7 @@ impl MarketCoinOps for TestCoin {
 
     fn base_coin_balance(&self) -> BalanceFut<BigDecimal> { unimplemented!() }
 
-    fn platform_ticker(&self) -> &str { unimplemented!() }
+    fn platform_ticker(&self) -> &str { &self.ticker }
 
     /// Receives raw transaction bytes in hexadecimal format as input and returns tx hash in hexadecimal format
     fn send_raw_tx(&self, tx: &str) -> Box<dyn Future<Item = String, Error = String> + Send> { unimplemented!() }
@@ -366,6 +366,8 @@ impl MmCoin for TestCoin {
     fn coin_protocol_info(&self) -> Vec<u8> { Vec::new() }
 
     fn is_coin_protocol_supported(&self, _info: &Option<Vec<u8>>) -> bool { true }
+
+    fn required_counterparty_capabilities(&self) -> Vec<&'static str> { Vec::new() }
 
     fn burn_pubkey(&self) -> Vec<u8> { Vec::new() }
 

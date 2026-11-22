@@ -241,6 +241,49 @@ They cover CRD chapter 59 §59.4A, test T14.
 | T14 (e) carriage | The three order-match messages and the synchronization answers carry the bytes unchanged; the trie root is equal with and without the word |
 | T14 (f) decisions | A test coin that requires `tx_v6`: reservations and requests without it are neither connected nor reserved, with it both go ahead, and no swap or penalty record appears |
 
+## Orders that lack a required capability are not listed
+
+Location: the module `t16_capability_presentation_tests` of `mm2src/mm2_main/src/ordermatch_tests.rs`
+(order book; runs with `ordermatch_tests`), and in the `coins` crate `mm2src/coins/coin_protocol_capability.rs`
+(module `tests`), the module `sighash_suffix_gate_tests` of `mm2src/coins/utxo/utxo_tests.rs`, the module
+`ironwood_v6_counterparty_tests` of `mm2src/coins/z_coin.rs` and `mm2src/coins/z_coin/z_note_lock_tests.rs`.
+They cover CRD chapter 59 §59.4C, test T16. The order-book tests use a UTXO coin whose configuration entry sets
+a sighash suffix, a second node whose own request handler answers as the relay, and no network.
+
+Every T16 (g) test that expects a refusal checks three surfaces for the same request: the shared path with the
+text error, the typed core of the method (`buy_core`, `sell_core`), which must fail with
+`OrderNotMatchableMissingCapability` naming the coin, the capability and the named orders in ascending order
+(HTTP 400, the refusal text as its `Display`), and the legacy handler, which must answer the refusal text. No
+taker order, active record, request or subscription exists after any of them. Every test that expects the
+request to proceed places it through the shared path and then through the typed core as well. The wire form
+of the typed error is pinned in `mm2src/mm2_main/src/lp_ordermatch/order_rpc_tests.rs` (runs with
+`order_rpc_tests`).
+
+| Test | CRD | What is tested |
+|------|-----|----------------|
+| `t16_a_configuration_entry_of_a_coin_with_a_sighash_suffix`, `t16_a_configuration_entry_of_a_shielded_coin`, `t16_a_a_coin_of_another_family_and_an_unknown_coin_require_nothing` (coins) | T16 (a), R59.4C.1 | The required set read from a configuration entry: `sighash_suffix` for a UTXO, QTUM, BCH or QRC20 entry with a non-zero suffix, nothing with its switch off, with a zero suffix or with keys that do not parse; `tx_v6` for a shielded entry inside the window (built-in time, configured time or height), nothing before it, with its switch off or without an Ironwood upgrade; nothing for a coin of another family, a plain UTXO coin, an entry without a protocol and a coin without an entry |
+| `t16_a_the_set_is_read_from_the_activated_coin_first_and_from_the_configuration_otherwise` (coins) | T16 (a), R59.4C.1 | The entry point reads the activated coin when the coin is activated and the configuration entry otherwise, with and without waiting; without waiting, while the registry of activated coins is in use, it reads the configuration entry |
+| `ch59_t16_a_a_coin_with_a_suffix_requires_the_word_and_nothing_with_its_switch_off`, `ch59_t16_a_the_activated_coin_and_its_configuration_entry_give_the_same_set` (coins, UTXO) | T16 (a), R59.4C.1 | An activated UTXO coin with a suffix requires `sighash_suffix`, and nothing with its switch off or without a suffix; a coin built from a configuration entry and that entry give the same set |
+| `ch59_t16_a_a_shielded_coin_requires_tx_v6_inside_the_window_only`, `ch59_t16_a_the_activated_coin_and_its_configuration_entry_give_the_same_set` (coins, shielded) | T16 (a), R59.4C.1 | The shielded coin's required set is the predicate of its acceptance check at every instant; for a configured or built-in Ironwood time or height the activated coin and its configuration entry agree, and a height discovered at run time is known to the activated coin only |
+| `t16_b_missing_capabilities_reads_as_the_reader_does` (coins), `t16_b_an_order_is_presentable_exactly_when_it_declares_what_its_coins_require`, `t16_b_the_missing_capability_names_the_coin_and_judges_the_base_coin_first` | T16 (b), R59.4C.2 | The first value followed by the word is presentable; the first value alone, empty information and a malformed word are not, for the coin as base and as rel; all four are presentable for a pair that requires nothing; an order of the node's own is presentable with empty information |
+| `ch59_t16_c_an_order_is_not_presentable_exactly_when_the_acceptance_check_declines_for_a_capability` (coins), `ch59_t16_the_coin_methods_give_the_required_set_the_acceptance_check_applies` (coins; needs the Sapling parameter files, else skipped) | T16 (c) | Over one table of UTXO coins (plain, with a suffix, switch off, segwit) and shielded coins (inside and before the window, switch off, no upgrade, configured and discovered height) and fourteen protocol-information values: a required key is missing exactly when the capability rule of the coin's acceptance check declines the value, and the acceptance check of a UTXO coin is its first-value test and that rule |
+| `t16_d_orderbook_lists_one_ask_and_one_bid_with_the_totals_of_the_listed_orders` | T16 (d), R59.4C.3 | With one presentable and two unpresentable orders on each side, the legacy and the mmrpc-2.0 `orderbook` list one ask and one bid; counts, totals and running sums equal those of a book that holds the presentable orders alone; the stored book keeps all six |
+| `t16_d_best_orders_of_both_generations_list_the_presentable_order_only` | T16 (d), R59.4C.3 | The legacy and the mmrpc-2.0 `best_orders`, buying and selling, by volume and by number, from either coin of the pair, list the presentable order only |
+| `t16_d_the_event_stream_emits_nothing_for_an_unpresentable_order` | T16 (d), R59.4C.3 | The stream of a pair emits the arrival, the update and the removal of the presentable ask and bid, and nothing for the four others |
+| `t16_d_an_order_filed_under_the_own_ticker_of_an_aliased_coin_is_listed_only_with_the_capability` | T16 (d), R59.4C.1, R59.4C.3 | On a node that trades the requiring coin under an order-book ticker, orders filed under the coin's own ticker are judged like any other: the event stream emits the presentable ask and bid only, and `best_orders` of both generations asked from the other coin of the pair lists the presentable order only |
+| `t16_d_orderbook_depth_counts_presentable_orders_of_a_pair_the_node_holds` | T16 (d), R59.4C.3 | `orderbook_depth` counts one ask and one bid for a pair the node holds |
+| `t16_e_the_answers_to_a_peer_contain_every_order`, `t16_e_the_answers_and_the_trie_root_are_those_of_a_node_without_the_requirement` | T16 (e), R59.4C.4 | The answers to a peer's full-order-book, best-orders (by volume and by number) and depth requests contain every order, in the same selection as before; the answers and the pair's trie root equal those of a node without the requirement, and the root differs from that of the presentable orders alone |
+| `t16_f_a_thinned_answer_is_refilled_from_the_fetched_book_by_number`, `t16_f_a_thinned_answer_is_refilled_from_the_fetched_book_by_volume`, `t16_f_an_answer_that_loses_nothing_triggers_no_fetch`, `t16_f_a_failed_fetch_yields_the_relay_answer_without_the_unpresentable_orders`, `t16_f_a_fetch_that_no_relay_answers_yields_the_relay_answer_without_the_unpresentable_orders` | T16 (f), R59.4C.5 | A relay answer that holds only unpresentable orders yields the presentable order at a worse price after one fetch of the pair's book, by number and by volume; an answer that loses nothing fetches nothing and subscribes to nothing; a failed fetch, and a fetch that no relay answers, yield the relay's answer without the unpresentable orders |
+| `t16_g_match_by_naming_one_held_unpresentable_order_is_refused`, `t16_g_a_named_order_that_is_not_held_proceeds`, `t16_g_one_presentable_order_of_two_named_proceeds`, `t16_g_match_by_public_key_and_no_match_by_proceed` | T16 (g), R59.4C.6 | `buy` and `sell` with `match_by` naming held, unpresentable orders are refused with the error text, and no taker order, active record, request or subscription exists afterwards; a named order that is not held, one presentable order of two (for `buy` and for `sell`), `match_by` by public key, `match_by` of kind any, no `match_by` and an empty list of orders proceed |
+| `t16_g_a_named_order_of_another_pair_proceeds` | T16 (g), R59.4C.6 | For `buy` and `sell`, a named, held order of another pair proceeds although one of its coins requires a capability the order does not declare: a pair with no coin of the request, with the coin that requires nothing, and with the coin that requires the capability as base or as rel |
+| `t16_g_a_named_order_on_the_side_the_request_cannot_match_proceeds`, `t16_g_one_named_order_the_request_cannot_match_is_enough_to_proceed` | T16 (g), R59.4C.6 | On the request's pair, an unpresentable order on the side the request takes is refused (`buy`: base and rel as the request names them; `sell`: swapped), and the same order on the other side proceeds; one held order the request cannot match among the named ones lets the request proceed, like an order the node does not hold |
+| `t16_g_the_pair_and_the_side_are_compared_with_order_book_tickers` | R59.4C.6 | With a coin that trades under an order-book ticker, an order naming either ticker of the coin is judged on the matchable side (refused without the capability, with the coin named by its own ticker; proceeds with it) and is not judged on the other side or on another pair |
+| `t16_g_a_named_order_of_the_nodes_own_proceeds` | T16 (g), R59.4C.6 | A named order of the node's own with empty protocol information proceeds, under a per-order key and under the node's persistent key; the same order of a peer is refused; one own order among the named ones is enough |
+| `t16_g_the_refusal_names_the_coin_and_the_capability_of_the_named_order_with_the_lowest_identifier` | R59.4C.6 | With two held, unpresentable named orders that lack different capabilities of different coins, the refusal names those of the order with the lowest identifier, whichever the request lists first; within an order its base coin is judged before its rel coin, for `buy` and for `sell` |
+| `taker_order_error_wire_forms` (case `OrderNotMatchableMissingCapability`), `order_not_matchable_missing_capability_wire_form` (`order_rpc_tests`) | R59.4C.6 | The typed error of the early refusal serializes with the `error_type` `OrderNotMatchableMissingCapability` and an `error_data` object with exactly the members `coin`, `capability` and `orders` (the identifiers as strings), has the HTTP status 400, and its `Display` text is the refusal text |
+| `buy_and_sell_refuse_named_orders_that_lack_a_required_capability` (`order_rpc_tests`) | T16 (g), R59.4C.6 | For `buy` and `sell`, with two held orders of a peer on the matchable side that declare nothing: the typed core fails with `OrderNotMatchableMissingCapability` (the coin, the capability, the named orders in ascending order although the request lists them in descending order; HTTP 400), the legacy handler answers one location token and the refusal text, and no taker order is placed; once no coin requires anything, the same requests are placed on both surfaces |
+| `t16_h_with_the_switch_off_orderbook_lists_every_order`, `t16_h_with_the_switch_off_orderbook_depth_counts_every_order`, `t16_h_with_the_switch_off_the_event_stream_emits_every_order`, `t16_h_with_the_switch_off_best_orders_lists_the_relay_answer_and_fetches_nothing`, `t16_h_with_the_switch_off_match_by_naming_an_unpresentable_order_proceeds` | T16 (h), R59.4C.7 | With the requirement's switch off, `orderbook`, `orderbook_depth`, the event stream, `best_orders` (no fetch) and `match_by` give the results of a node without the requirement |
+
 ## ARRR requires the version-6 capability word
 
 Location: `mm2src/coins/z_coin.rs` (module `ironwood_v6_counterparty_tests`), `mm2src/coins/z_coin/z_note_lock_tests.rs`
@@ -769,6 +812,34 @@ first test below; the positive cases of T6 are unchanged.
 Not covered: the raw-transaction signing request end to end (a lab row on the wire covers the text); the four swap
 functions that pass the error on (it cannot occur for the outputs they build).
 
+## EVM HD balance maps of a platform ticker (9 tests, plus one emulator test)
+
+Location: `mm2src/coins_activation/src/evm_hd_p2_tests.rs` (names start with `evm_hd_p2_`) and one emulator test in
+`mm2src/coins/eth/eth_trezor_emulator_tests.rs`. CRD: chapter 49, R49.32 items 1 to 3, R49.33, T49.31; chapter 35,
+R35.1.3(b). Run with `cargo test -p coins_activation --lib evm_hd_p2_`. A platform with two ERC-20 tokens is activated
+through the public routines against a scripted EVM node that answers per address and per token contract and records
+every balance query. The tokens' `balanceOf` queries are recorded by contract.
+
+| Test | CRD | What is tested |
+|---|---|---|
+| `evm_hd_p2_get_new_address_for_the_platform_answers_the_platform_and_every_token` | R49.32 item 1, R49.33 | The map holds exactly the platform and both tokens, zero balances included; the address is the EIP-55 form |
+| `evm_hd_p2_account_balance_and_its_task_form_list_every_ticker_at_every_address` | R49.32 item 1 | `account_balance` and `task::account_balance::init` list the three tickers at every address; the task total sums each ticker |
+| `evm_hd_p2_the_scan_lists_intervening_addresses_with_an_empty_map_and_finds_a_token_only_address` | R49.32 items 2, 3 | From a known count of 1 the scan finds address 2 that holds only a token, lists address 1 with `{}` and address 2 with all tickers |
+| `evm_hd_p2_the_scan_counts_an_address_used_by_its_nonce_or_platform_balance_with_the_full_map` | R49.32 item 3 | A used address found by its nonce carries the full map |
+| `evm_hd_p2_a_token_removed_by_disable_coin_leaves_the_maps` | R49.32 item 1 | After `disable_coin` of one token, each address lists two tickers |
+| `evm_hd_p2_a_token_ticker_answers_that_token_only_and_the_platform_counts_the_new_address` | R49.32 | `get_new_address` for a token answers that token only, asks no other token, and the platform then lists the address |
+| `evm_hd_p2_a_failing_token_balance_fails_the_platform_ticker_request_as_a_whole` | R49.32 item 1 | One failing token query fails the four methods of the platform ticker; no partial map |
+| `evm_hd_p2_a_token_ticker_asks_no_other_tokens_balance` | R49.32 | With another token's `balanceOf` failing, a token ticker's `account_balance`, its task form and its scan still answer, and no other token is asked |
+| `evm_hd_p2_the_activation_report_keeps_the_platform_and_every_token_and_asks_each_token_once_per_address` | R35.1.3(b) | The activation report's maps and total hold the platform and every token, and each token's `balanceOf` is asked once per address |
+
+The Trezor policy: `emulator_trezor_account_balance_of_a_platform_ticker_lists_the_platform_and_its_tokens` checks the
+maps and the total of `task::account_balance::init` of a Trezor HD platform with one token; it runs in the emulator job
+and prints a skip line when no emulator is reachable. The scan and `get_new_address` under the Trezor policy are not
+covered by an emulator test. The unchanged answers of a TRON platform and of a TRC20 ticker are pinned by
+`a_trc20_ticker_answers_its_own_ticker_only_and_its_scan_finds_a_token_only_address` and
+`an_address_is_used_when_the_chain_has_its_account_or_an_enabled_token_balance_is_not_zero` in
+`mm2src/coins/eth/tron/hd_tests.rs`.
+
 ## EVM HD address methods and ERC-20 `from` (10 tests)
 
 Location: `mm2src/coins_activation/src/evm_hd_p1_tests.rs` (names start with `evm_hd_p1_`). CRD: chapter 49, R49.32 (last
@@ -778,11 +849,11 @@ address and records every balance and nonce query.
 
 | Test | CRD | What is tested |
 |---|---|---|
-| `evm_hd_p1_get_new_address_answers_the_full_checksummed_address` | R49.33, R35.1.3 | `get_new_address` on an EVM HD platform answers the full 42-character EIP-55 address and the platform ticker only |
+| `evm_hd_p1_get_new_address_answers_the_full_checksummed_address` | R49.33, R35.1.3 | `get_new_address` on an EVM HD platform answers the full 42-character EIP-55 address and the platform and its token |
 | `evm_hd_p1_the_scan_task_for_an_evm_hd_platform_reaches_the_evm_scan` | ch.05 R54 | `task::scan_for_new_addresses::init` on an EVM HD platform runs the EVM scan, finds a used address and answers it in the full form |
 | `evm_hd_p1_get_new_address_with_a_token_ticker_answers_the_token_only_and_the_platform_lists_it` | R49.32, T49.31 | A token ticker answers a map with that token only; the platform's `account_balance` then lists the new address |
 | `evm_hd_p1_account_balance_with_a_token_ticker_answers_token_only_maps` | R49.32 | `account_balance` and the account balance of the task route answer token-only maps and token-only totals |
-| `evm_hd_p1_the_scan_with_a_token_ticker_finds_an_address_that_holds_only_that_token` | R49.32 | The token scan finds an address with nonce 0 and only the token; the platform ticker's scan still does not |
+| `evm_hd_p1_the_scan_with_a_token_ticker_finds_an_address_that_holds_only_that_token` | R49.32 | The token scan finds an address with nonce 0 and only the token, which the platform's wallet then knows |
 | `evm_hd_p1_a_token_on_a_single_key_platform_keeps_its_current_answer` | R49.32 | A token on a single-key platform answers `CoinIsActivatedNotWithHDWallet` on the three methods |
 | `evm_hd_p1_a_token_withdraw_with_from_is_sent_from_the_selected_address_on_both_routes` | R49.34, T49.32 | Both selector forms on `withdraw` and `task::withdraw::init`: the selected address supplies balance and nonce, its key signs, `from` is that address |
 | `evm_hd_p1_a_token_withdraw_without_from_is_sent_from_the_activated_address` | R49.34 item 4 | Without `from` both routes send from the activated address |

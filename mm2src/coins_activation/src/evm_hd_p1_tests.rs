@@ -200,8 +200,8 @@ fn evm_hd_p1_get_new_address_answers_the_full_checksummed_address() {
     assert_eq!(address.to_lowercase(), address_at(&ctx, 3));
     assert_eq!(
         tickers(&answer["new_address"]["balance"]),
-        vec![PLATFORM.to_owned()],
-        "the platform ticker only"
+        vec![PLATFORM.to_owned(), TOKEN.to_owned()],
+        "the platform ticker and the activated token (R49.32 item 1)"
     );
 }
 
@@ -258,7 +258,7 @@ fn evm_hd_p1_get_new_address_with_a_token_ticker_answers_the_token_only_and_the_
     assert_eq!(tickers(&answer["new_address"]["balance"]), vec![TOKEN.to_owned()]);
     assert_eq!(answer["new_address"]["balance"][TOKEN]["spendable"], "5");
 
-    // The platform's own answer lists the generated address, with the platform ticker only.
+    // The platform's own answer lists the generated address, with the platform ticker and the token.
     assert_eq!(known_addresses(&ctx), 4);
     let platform = coin(&ctx, PLATFORM);
     let listed = block_on(platform.account_balance_rpc(account_params())).unwrap_or_else(|e| panic!("{e}"));
@@ -267,7 +267,7 @@ fn evm_hd_p1_get_new_address_with_a_token_ticker_answers_the_token_only_and_the_
     assert_eq!(addresses.len(), 4);
     assert_eq!(addresses[3]["address"].as_str().unwrap().to_lowercase(), fourth);
     for entry in addresses {
-        assert_eq!(tickers(&entry["balance"]), vec![PLATFORM.to_owned()]);
+        assert_eq!(tickers(&entry["balance"]), vec![PLATFORM.to_owned(), TOKEN.to_owned()]);
     }
 }
 
@@ -312,11 +312,8 @@ fn evm_hd_p1_the_scan_with_a_token_ticker_finds_an_address_that_holds_only_that_
     let token_only = address_at(&ctx, 3);
     chain.set_token(&token_only, 4_000_000);
 
-    // The platform ticker's rule is unchanged: it does not find the address.
-    let platform = coin(&ctx, PLATFORM);
-    let by_platform =
-        block_on(platform.init_scan_for_new_addresses_rpc(scan_params(2))).unwrap_or_else(|e| panic!("{e}"));
-    assert!(by_platform.new_addresses.is_empty());
+    // (The platform ticker's scan finds this address too, by the token-aware rule of R49.32 item 3; see
+    // `evm_hd_p2_the_scan_lists_unqueried_addresses_with_an_empty_map_and_finds_a_token_only_address`.)
     assert_eq!(known_addresses(&ctx), 3);
 
     let token = coin(&ctx, TOKEN);
@@ -427,6 +424,53 @@ fn from_of(details: &TransactionDetails) -> Vec<String> {
 fn id_form(address_id: u32) -> Json { json!({ "account_id": 0, "chain": "External", "address_id": address_id }) }
 
 fn path_form(path: &str) -> Json { json!({ "derivation_path": path }) }
+
+/// CRD ch.43 D43.1F.3 (b): a token looks its platform up in the registered view, so a token of a passive HD platform
+/// keeps answering `get_new_address`, `account_balance` and `withdraw` with `from` from the platform's wallet.
+#[test]
+fn evm_hd_p1_a_token_of_a_passive_hd_platform_keeps_answering_its_hd_methods_and_withdraw_from() {
+    let (chain, _node, ctx) = hd_setup();
+    let first = address_at(&ctx, 0);
+    let selected = address_at(&ctx, 1);
+    let fourth = address_at(&ctx, 3);
+    chain.set_token(&first, 10_000_000);
+    chain.set_token(&selected, 10_000_000);
+    chain.set_token(&fourth, 5_000_000);
+    chain.set_nonce(&selected, 7);
+
+    let coins_ctx = coins::CoinsContext::from_ctx(&ctx).unwrap();
+    assert!(
+        block_on(coins_ctx.make_passive(PLATFORM)),
+        "the platform has a dependent token"
+    );
+    assert!(
+        block_on(lp_coinfind(&ctx, PLATFORM)).unwrap().is_none(),
+        "the passive platform is not an active coin"
+    );
+
+    let token = coin(&ctx, TOKEN);
+    let response = block_on(token.get_new_address_rpc(get_new_address_params())).unwrap_or_else(|e| panic!("{e}"));
+    let answer = serde_json::to_value(&response).unwrap();
+    assert_eq!(
+        answer["new_address"]["address"].as_str().unwrap().to_lowercase(),
+        fourth
+    );
+    assert_eq!(tickers(&answer["new_address"]["balance"]), vec![TOKEN.to_owned()]);
+    assert_eq!(answer["new_address"]["balance"][TOKEN]["spendable"], "5");
+
+    let answer = block_on(token.account_balance_rpc(account_params())).unwrap_or_else(|e| panic!("{e}"));
+    let answer = serde_json::to_value(&answer).unwrap();
+    let addresses = answer["addresses"].as_array().unwrap();
+    assert_eq!(addresses.len(), 4);
+    for entry in addresses {
+        assert_eq!(tickers(&entry["balance"]), vec![TOKEN.to_owned()]);
+    }
+    assert_eq!(addresses[1]["balance"][TOKEN]["spendable"], "10");
+
+    let details = direct(&ctx, withdraw_request(Some(id_form(1)))).unwrap_or_else(|e| panic!("{:?}", e.0));
+    assert_eq!(signer(&details), selected, "the key of the selected address signs");
+    assert_eq!(from_of(&details), vec![checksum_address(&selected)]);
+}
 
 #[test]
 fn evm_hd_p1_a_token_withdraw_with_from_is_sent_from_the_selected_address_on_both_routes() {
