@@ -104,6 +104,10 @@ pub struct SolanaActivationParams {
     /// set aside after a failure, see the pool.
     #[serde(default)]
     client_urls: Vec<String>,
+    /// The one node whose reads decide the refund and secret steps of a swap (CRD ch.40 R40.6D.16, chapter 51
+    /// R100). Must be one of the nodes above.
+    #[serde(default)]
+    swap_evidence_node: Option<String>,
 }
 
 /// A member that must be present: a missing `confirmation_commitment` fails request parsing, as it did before the
@@ -129,6 +133,10 @@ impl std::fmt::Debug for SolanaActivationParams {
                 &self.client_url.as_deref().map(crate::node_url::host_only),
             )
             .field("client_urls", &client_urls)
+            .field(
+                "swap_evidence_node",
+                &self.swap_evidence_node.as_deref().map(crate::node_url::host_only),
+            )
             .finish()
     }
 }
@@ -141,8 +149,18 @@ impl SolanaActivationParams {
             confirmation_commitment: None,
             client_url: None,
             client_urls: urls,
+            swap_evidence_node: None,
         }
     }
+
+    /// The same parameters with the evidence node of CRD ch.40 R40.6D.16.
+    pub fn with_swap_evidence_node(mut self, url: Option<String>) -> Self {
+        self.swap_evidence_node = url;
+        self
+    }
+
+    /// The evidence node the request names, if any.
+    pub fn swap_evidence_node(&self) -> Option<&str> { self.swap_evidence_node.as_deref() }
 
     /// Flattened endpoint list in dispatch order.
     pub(crate) fn collected_urls(&self) -> Vec<String> {
@@ -176,6 +194,29 @@ impl<'de> serde::Deserialize<'de> for SolanaNodeUrl {
             Ok(parsed) if parsed.has_host() => Ok(SolanaNodeUrl(url)),
             _ => Err(serde::de::Error::custom("Invalid node `url`: expected an absolute URL")),
         }
+    }
+}
+
+/// Why a `swap_evidence_node` is refused (CRD ch.40 R40.6D.16, chapter 51 R100).
+#[derive(Debug, Display, PartialEq, Eq)]
+pub enum SwapEvidenceNodeError {
+    #[display(fmt = "`swap_evidence_node` must be one of the coin's nodes")]
+    NotInNodeList,
+}
+
+/// The `swap_program_id` of a coins entry (CRD ch.40 R40.6D.2): `protocol.protocol_data.swap_program_id`, a base58
+/// public key. `None` when the member is absent or null.
+///
+/// # Errors
+///
+/// The member is present and is not a base58 32-byte public key (the entry is then unparsable, R40.6B.3 item 1).
+pub fn swap_program_id_from_conf(conf: &Json) -> Result<Option<Pubkey>, String> {
+    match &conf["protocol"]["protocol_data"]["swap_program_id"] {
+        Json::Null => Ok(None),
+        Json::String(text) => Pubkey::from_str(text)
+            .map(Some)
+            .map_err(|_| "invalid `swap_program_id`: expected a base58 public key".to_owned()),
+        _ => Err("invalid `swap_program_id`: expected a base58 public key".to_owned()),
     }
 }
 
@@ -312,6 +353,12 @@ pub async fn solana_coin_with_node_order(
     order: SolanaNodeOrder,
 ) -> Result<SolanaCoin, String> {
     let urls = params.collected_urls();
+    let evidence_node = params.swap_evidence_node.clone();
+    if let Some(node) = &evidence_node {
+        if !urls.iter().any(|url| url == node) {
+            return Err(SwapEvidenceNodeError::NotInNodeList.to_string());
+        }
+    }
     if urls.is_empty() {
         return Err("Solana activation requires at least one RPC endpoint (client_url or client_urls)".to_owned());
     }
@@ -333,7 +380,10 @@ pub async fn solana_coin_with_node_order(
         decimals,
         spl_tokens_infos,
         settings: SolanaCoinSettings::default(),
+        history: SolanaHistoryStates::default(),
+        swap: SolanaSwapConfig::default(),
     }));
+    solana_coin.set_swap_evidence_node(evidence_node);
     Ok(solana_coin)
 }
 
@@ -346,6 +396,50 @@ pub struct SolanaCoinImpl {
     pub(crate) my_address: String,
     pub(crate) spl_tokens_infos: Arc<Mutex<HashMap<String, SplTokenInfo>>>,
     pub(crate) settings: SolanaCoinSettings,
+    /// The transaction-history states of the platform and of its tokens (CRD ch.40 §40.6C).
+    pub history: SolanaHistoryStates,
+    /// The program check and the evidence node of the SOL swap legs (CRD ch.40 §40.6D).
+    pub swap: SolanaSwapConfig,
+}
+
+/// Whether the transaction history of a Solana platform runs (CRD ch.40 R40.6C.1) and the `history_sync_status` of
+/// each coin it writes, platform and tokens, by ticker. The history is not enabled until [`Self::enable`]; the
+/// states of a coin that is not enabled are `NotEnabled` (R40.6C.2).
+#[derive(Debug, Default)]
+pub struct SolanaHistoryStates {
+    enabled: AtomicBool,
+    states: Mutex<HashMap<String, HistorySyncState>>,
+}
+
+impl SolanaHistoryStates {
+    pub fn is_enabled(&self) -> bool { self.enabled.load(AtomicOrdering::SeqCst) }
+
+    /// Enables the history; the activation of a new platform instance calls it once, before the instance is
+    /// registered, so no `my_tx_history` answer sees it half started.
+    pub fn enable(&self) { self.enabled.store(true, AtomicOrdering::SeqCst) }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, HistorySyncState>> {
+        self.states.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The state of `ticker`: `NotEnabled` without history, `NotStarted` before the first pass reported.
+    pub fn state_of(&self, ticker: &str) -> HistorySyncState {
+        if !self.is_enabled() {
+            return HistorySyncState::NotEnabled;
+        }
+        self.lock().get(ticker).cloned().unwrap_or(HistorySyncState::NotStarted)
+    }
+
+    pub(crate) fn set(&self, ticker: &str, state: HistorySyncState) { self.lock().insert(ticker.to_owned(), state); }
+
+    /// Sets a state that describes work in progress or a failure: only until the coin's history has finished once
+    /// (CRD ch.40 R40.6C.9).
+    pub(crate) fn set_unfinished(&self, ticker: &str, state: HistorySyncState) {
+        let mut states = self.lock();
+        if !matches!(states.get(ticker), Some(HistorySyncState::Finished)) {
+            states.insert(ticker.to_owned(), state);
+        }
+    }
 }
 
 /// The per-coin confirmation settings that `set_required_confirmations` and `set_requires_notarization` store and

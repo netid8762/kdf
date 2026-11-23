@@ -358,8 +358,9 @@ These are divergences from GLEEC KDF that no compatibility switch reverses in th
 - **ZEC version-5 transactions.** With a ZEC entry of `txversion` 5, KDF Reloaded builds and reads version-5 transactions in the ZIP 225 format with the ZIP 244 transaction id and signature, as the Zcash network requires since NU7. GLEEC KDF has no version-5 support: with that entry it builds a version-4 body that the network refuses. KDF Reloaded also refuses at activation a Zcash-family entry whose `txversion` it cannot build (not 4 or 5) and a version-5 entry without a branch id; GLEEC KDF accepts any `txversion`. No switch. CRD ch.39 §39.11.4V status notes.
 - **Withdraw with an omitted HD `from`.** For an HD-mode UTXO wallet, `withdraw` and `task::withdraw` with no `from` sender spend from the coin's activated address, the address at `path_to_address` (by default account 0, external chain, index 0), instead of failing. GLEEC KDF rejects an omitted `from` with `FromAddressNotFound`. This makes the shipped Komodo DeFi wallet's withdraw-preview flow (which omits `from`) work against a reloaded node; the maintainer kept it deliberately on 2026-11-04, set the address on 2026-11-06, and no switch is planned. An explicit but invalid `from` is still rejected (`UnknownAccount` / `UnexpectedFromAddress`) on both methods. Until plan [`hd-key-unification`](docs/plans/hd-key-unification.md) item H5 (PR #270), the fallback was always account 0, external chain, index 0, and the direct `withdraw` method refused an HD UTXO wallet. Code: `coins/utxo/utxo_common/utxo_common_hd.rs` (`get_withdraw_hd_sender`), `utxo_withdraw.rs` (`resolve_withdraw_sender`), `utxo_common_helpers.rs` (`withdraw_with_hd_sender`, `validate_task_withdraw_sender`).
 - **An HD account number already in use.** `task::create_new_account` with an `account_id` that the wallet already holds ends the task with `AccountAlreadyExists` (with the `account_id`) before any key is derived; `task::create_new_account::status` reports it. GLEEC KDF derives the key first and then reports an internal error. Only a client that asks for an existing account sees the difference. The same task also serves Siacoin, which GLEEC KDF does not offer HD accounts for; that is a Reloaded extension (the maintainer's decision of 2026-11-04). Plan [`hd-key-unification`](docs/plans/hd-key-unification.md) item H5.4 (PR #279); CRD ch.05 R35c. Code: `coins/hd_wallet.rs` (`choose_new_account_id`), `coins/rpc_command/init_create_account.rs`.
-- **`get_my_address` while a Trezor is initialized.** For an EVM coin that is not activated, KDF Reloaded derives the reported address from the login's key, also when a Trezor context exists. GLEEC KDF derives it from the device whenever a Trezor context exists. As on GLEEC KDF, each coin takes its keys and stores its accounts by its own key policy, and only a coin activated for the Trezor is refused key export. Two points still differ: a new address of a coin activated for the Trezor is not confirmed on the device, and the BCH activation task refuses the Trezor policy (CRD ch.05 §5.10B). Batch 4 item B4-2 (PR #293); CRD ch.05 §5.10B R57 and D7.e.
+- **`get_my_address` while a Trezor is initialized.** For an EVM coin that is not activated, KDF Reloaded derives the reported address from the login's key, also when a Trezor context exists. GLEEC KDF derives it from the device whenever a Trezor context exists. As on GLEEC KDF, each coin takes its keys and stores its accounts by its own key policy, and only a coin activated for the Trezor is refused key export. One point still differs: the BCH activation task refuses the Trezor policy (CRD ch.05 §5.10B). A new address of a coin activated for the Trezor is confirmed on the device by `task::get_new_address` and not by the direct `get_new_address`, in both implementations (PR #491; CRD ch.49 R49.42). Batch 4 item B4-2 (PR #293); CRD ch.05 §5.10B R57 and D7.e.
 - **A Trezor replaced while its coins are active.** A coin activated under the Trezor policy keeps the identity of the device it was activated with. After `task::init_trezor` puts a different device in the slot, the coin answers `FoundUnexpectedDevice` to `task::create_new_account`, `get_new_address` and a withdrawal before it asks the device or writes anything; it works again with its own device, or after it is activated anew with the other one. A swap, also one that was already running, keeps signing with the coin's own device and refuses any other. GLEEC KDF uses the new device's keys against the old device's accounts. The maintainer decided on 2026-11-08 that no switch restores it. Batch 4 item B4-14 (PR #302); CRD ch.05 §5.10B R58a and R58a.1. Code: `crypto/src/hw_ctx.rs` (`ensure_same_device`), `coins/hd_pubkey.rs`.
+- **`task::get_new_address` follows the coin's key policy.** `task::get_new_address::init`, `::status`, `::user_action` and `::cancel` derive, record and query without any device state when the coin uses software keys, also while a hardware wallet is connected, and complete with the answer of `get_new_address` (states `Preparing` and `RequestingAccountBalance`); a TRX or TRC20 ticker and a Siacoin complete this way. With a Trezor the task asks the device to show the address, reports `{"ConfirmAddress": {"expected_address": ...}}` while it waits for the button, and records the address only after the press. GLEEC KDF runs this task on the device path for every coin, so with software keys it ends with `HwContextNotInitialized` and a TRX or TRC20 ticker can never complete. Further differences: a device that shows another address than the one derived ends the task with `DeviceAddressMismatch` and both addresses (GLEEC KDF: `Internal`); the task runs the gap check and answers `EmptyAddressesLimitReached` with the request's `gap_limit` (the direct `get_new_address` of KDF Reloaded still runs none); the `Internal` chain is refused for EVM and TRON coins with `InvalidBip44Chain` in the task and the direct form (the GLEEC KDF task accepts both chains); there is no address-subscription step and no `FailedScripthashSubscription`. The comparison the user makes on the device's screen is the check that matters. CRD ch.49 §49.2.3, ch.05 R54.
 - **A coin's `derivation_path` changed between sessions under an HD login.** Under an HD login with the seed as the key source, KDF Reloaded loads a coin's stored HD accounts only when each stored account key equals the key the seed derives for that account index below the coin's currently configured `derivation_path`; a stored account that differs is removed with one WARN and not loaded. After the coins file changes a coin's path, the coin therefore starts as a fresh HD wallet at the new path (the first account created and, by default, its addresses scanned up to the gap limit), and restoring the previous path brings the earlier addresses back the same way (the first account, or the one `path_to_address` names, scanned up to the gap limit; other accounts with `task::create_new_account`, addresses beyond the gap limit with `get_new_address`). No key material is lost in either implementation, since every address can be derived from the seed again at its path. GLEEC KDF loads stored accounts as stored: after a path change the earlier accounts and their addresses stay in use while the reported path is the new one. A coin activated under the Trezor policy loads its rows as stored. The WARN reads "…that the wallet's seed did not derive", which is inaccurate for this case. The maintainer decided on 2026-11-11 that this release documents it; a friendlier behavior is planned, see plan [`hd-account-storage-on-path-change`](docs/plans/hd-account-storage-on-path-change.md). The check came with batch 4 item B4-2 (PR #293); CRD ch.05 §5.10B, status note of 2026-11-11. Code: `coins/hd_wallet_storage/mod.rs` (`load_accounts_derived_from_seed`, `is_account_of_the_seed`), `coins/utxo/utxo_common/utxo_common_hd.rs` (`load_hd_accounts_from_storage`), `coins/eth/eth_activation.rs`.
 - **`page_balance` of a page that lists no address, and an HD account that knows no address.** `account_balance` of every HD coin answers `page_balance` as an object keyed by ticker, summed over the addresses of the returned page, as GLEEC KDF does. For a page that lists no address (past the known range), and for the `total_balance` of an account without a known address, KDF Reloaded answers one entry for the requested coin's ticker with a zero balance, where GLEEC KDF answers `{}`. Under the default `scan_policy`, KDF Reloaded also scans a stored account that has no known address at the next activation, for UTXO coins, QTUM, Sia and EVM coins including TRON; GLEEC KDF scans only a wallet that has no stored account, so an account left empty by a first activation that failed while scanning stays unscanned there. The maintainer decided on 2026-11-22 that no switch restores either behavior. CRD ch.49 R49.35 and R49.36 item 7, ch.38 R38.8.5, ch.05 R35a. Code: `coins/rpc_command/account_balance.rs`, `coins/coin_balance.rs` (`enable_hd_wallet`).
 - **Legacy `my_balance` and `get_enabled_coins` answer for an EVM coin under an HD login.** They report the activated address. GLEEC KDF fails both under an HD login, for EVM coins as for UTXO coins; for a UTXO coin KDF Reloaded fails them too. Code: `coins/eth/eth_market_ops.rs` (`my_address`), `coins/lp_coins_ops.rs` (`get_enabled_coins`). See CRD ch.05 §5.9B R35 and plan [`hd-key-unification`](docs/plans/hd-key-unification.md).
@@ -866,6 +867,22 @@ These are divergences from GLEEC KDF that no compatibility switch reverses in th
   writes `null`: Reloaded omits an absent memo in every withdraw result outside the Tendermint family. A client that
   needs the selector has it in its own request. No peer sees the result, so no switch exists. CRD ch.63 §63.8A,
   D63.8.
+
+- **The task form of a gasless TRON withdraw submits the transfer and follows it until it settles.** No released
+  GLEEC KDF version that the CRD records carries GasFree; in the reference's open, unmerged draft (as of 2026-05-04,
+  CRD ch.63 §63.8B) no RPC submits a signed authorization to the provider and none asks the provider about a
+  transfer: the direct `withdraw` and `task::withdraw::*` both end at the signed authorization, and the three task
+  phases for a submission are declared and never reported. In Reloaded the direct `withdraw` answers as the draft
+  does (sign-only). `task::withdraw::init` goes further: it submits the authorization once, reports
+  `SubmittingGaslessAuthorization`, `WaitingForGaslessProvider` and `WaitingForGaslessSettlement`, and asks the
+  provider every `status_poll_interval_ms` until the transfer is settled or 120 seconds have passed since the
+  signed deadline. Its final answer is the sign-only result with the provider's `trace_id` in the fee details and a
+  top-level `tx_hash` (the provider's transaction); the draft's task answer has `trace_id` `null` and no `tx_hash`.
+  The errors `QuoteExpired` and `TraceNotFound`, which the draft declares and never raises, are raised: the first
+  when the signed deadline has passed before the submission is sent, the second for a 404 of the provider's trace
+  request. A client that wants the draft's behavior uses the direct `withdraw`. No peer sees any of this, so no
+  switch exists; row in [`docs/GLEEC_COMPATIBILITY.md`](docs/GLEEC_COMPATIBILITY.md). CRD ch.63 §63.8B (R30 to
+  R35, D63.9 and its status note).
 - **A swap database migrated beyond state 15 is refused at start-up.** When the highest migration state in `MM2.db` is
   above the highest state the build knows (15 in both), KDF Reloaded stops at start-up with an error that names both
   numbers. GLEEC KDF starts, changes nothing and uses the database as a state-15 database without a warning. No
@@ -873,6 +890,27 @@ These are divergences from GLEEC KDF that no compatibility switch reverses in th
   different state 16, so that value identifies no layout. The refusal is compatible with GLEEC KDF: a database KDF
   Reloaded leaves at state 15 is fully migrated for both. No switch exists; row in
   [`docs/GLEEC_COMPATIBILITY.md`](docs/GLEEC_COMPATIBILITY.md). CRD ch.44 R44.9A.1 to R44.9A.5.
+- **The swap's secret is checked against its hash on every coin family.** A taker, and a watcher acting for one,
+  uses a value read from the transaction that claimed the taker payment as the swap's secret only when it matches
+  the swap's secret hash (RIPEMD-160 of SHA-256 for a 20-byte hash, SHA-256 for a 32-byte one); otherwise the read
+  fails as an extraction error. For ETH and ERC20 coins KDF Reloaded also reads the secret from the swap
+  contract's `ReceiverSpent` event in the transaction's receipt when the call input is not a direct claim call,
+  and for Tendermint coins it examines every message of the transaction. GLEEC KDF's reading for each coin family
+  is recorded in CRD ch.51 §51.6E. No message and no transaction a peer validates changes, so no switch exists;
+  row in [`docs/GLEEC_COMPATIBILITY.md`](docs/GLEEC_COMPATIBILITY.md). Plan
+  [`swap-chain-reading-correctness`](docs/plans/swap-chain-reading-correctness.md) step 2 (PR #488); CRD ch.51,
+  status note of 2026-11-22 before R31.
+- **An already-sent read that cannot decide stops the payment step.** Before a legacy swap sends its payment it
+  asks the paying coin whether that payment already exists. For EVM coins and tokens, QRC20 tokens and Sia, KDF
+  Reloaded answers an error that names the condition when the answer cannot be decided, and the payment step fails
+  without a broadcast; the manual recovery gets the same error. GLEEC KDF answers these cases differently (CRD ch.39
+  §39.11.5A). No switch exists. Row in [`docs/GLEEC_COMPATIBILITY.md`](docs/GLEEC_COMPATIBILITY.md). CRD ch.39
+  D39.11.5A.1; PR #489.
+- **A swap resumed at its payment step repeats an already-sent check that cannot decide.** In KDF Reloaded, a
+  legacy swap that a restart resumes right before its payment repeats the check within a bound, and then waits
+  without sending until the payment is found or the refund deadline passes. A swap that was not resumed at this
+  step asks once. GLEEC KDF asks once (CRD ch.39 §39.11.5A). No switch exists. Row in
+  [`docs/GLEEC_COMPATIBILITY.md`](docs/GLEEC_COMPATIBILITY.md). PR #489.
 
 - **Saved swap and order records are synced to disk when they are replaced.** Both write a saved swap through a
   temporary file and a rename. KDF Reloaded also forces the temporary file to disk before the rename and, on Unix,
@@ -888,6 +926,32 @@ These are divergences from GLEEC KDF that no compatibility switch reverses in th
   ordinary start of a saved swap, which resumes it if no other runner holds the lock after 40 seconds. The file's
   content is the same in both, so each respects the other's lock by its timestamp. No peer sees it, so no switch
   exists; row in [`docs/GLEEC_COMPATIBILITY.md`](docs/GLEEC_COMPATIBILITY.md). CRD ch.51 R5, ch.44 §44.9A.
+
+- **A Tendermint swap takes only a successful claim of its payment as the claim.** Both find the claim of a
+  Tendermint swap payment by a transaction search for the payment's HTLC id. KDF Reloaded pages through the results
+  and takes the oldest one that succeeded and holds a claim message for that HTLC in any of its messages; it skips
+  the others. GLEEC KDF reads the search result differently (CRD ch.51 R91). No peer sees it, so no switch exists;
+  row in [`docs/GLEEC_COMPATIBILITY.md`](docs/GLEEC_COMPATIBILITY.md). CRD ch.18 R18.11.16 and R18.11.19.
+
+- **The refund gate of SLP, QRC20, ETH and ERC20 swap payments reads the chain's time.** KDF Reloaded judges whether
+  such a payment can be refunded now by the chain: an SLP token by the median time past of BCH, a QRC20 token by that
+  of QTUM, an ETH or ERC20 coin by the latest block's timestamp once the local clock is past the lock time (then a
+  wait is at most a minute at a time). GLEEC KDF's rule for each coin family is recorded in CRD ch.51 §51.6E R88. A
+  refund can therefore start later than on GLEEC KDF (for an SLP token up to about an hour); no message and no
+  transaction a peer validates changes, so no switch exists; row in
+  [`docs/GLEEC_COMPATIBILITY.md`](docs/GLEEC_COMPATIBILITY.md). Plan
+  [`swap-chain-reading-correctness`](docs/plans/swap-chain-reading-correctness.md) step 3 (PR #490); CRD ch.51,
+  status note of 2026-11-22 after §51.6E R92.
+
+- **A QRC20 swap's spend or refund is recognized only from its own successful contract call.** KDF Reloaded takes a
+  transaction as the spend (refund) of a QRC20 swap payment only when the `receiverSpend` (`senderRefund`) call of
+  the swap goes to the swap contract the payment used and the receipt of that same output reports no exception and
+  holds the swap contract's `ReceiverSpent` (`SenderRefunded`) event for the swap id; it looks for a refund in the
+  history of the payment's sender, so a refund of the other side's payment is found as well. GLEEC KDF's search is
+  recorded in CRD ch.51 §51.6E R89. No message and no transaction a peer validates changes, so no switch exists; row
+  in [`docs/GLEEC_COMPATIBILITY.md`](docs/GLEEC_COMPATIBILITY.md). Plan
+  [`swap-chain-reading-correctness`](docs/plans/swap-chain-reading-correctness.md) step 4 (PR #496); CRD ch.51,
+  status note of 2026-11-22 after §51.6E R92.
 
 ### Removed / disabled in KDF Reloaded
 
@@ -907,8 +971,9 @@ These are divergences from GLEEC KDF that no compatibility switch reverses in th
   Solana coin or SPL token with "Trading is not supported for coin …", and
   every swap operation of such a coin answers an error that names it (CRD
   ch.60 R60.6.5). No switch exists: an abnormal end is no compatibility
-  target. There is no Solana transaction history yet, as in GLEEC KDF (CRD
-  ch.40 D40.1, D40.4).
+  target. Reloaded has a Solana and SPL transaction history of its own,
+  started by `tx_history: true` at the platform's activation; GLEEC KDF has
+  none (CRD ch.40 §40.6C, D40.4).
 - **TRON (TRX, TRC20) coins are wallet-only.** Since 2026-11-20 TRON can be
   activated again (0.4.0 refused it on every route): on the
   platform-with-tokens activation, `enable_eth_with_tokens` and the
@@ -930,11 +995,12 @@ These are divergences from GLEEC KDF that no compatibility switch reverses in th
   form and no order; Reloaded refuses one check earlier, and its text names the
   wallet-only ticker. No switch exists: the build constant
   `TRON_SWAPS_AVAILABLE` (`coins/lp_coins_ops.rs`) is `false` (CRD ch.21 R-D1,
-  R21.10B.9, R21.B3). Gasless TRC20 transfers through GasFree are signed but
-  not submitted yet: the provider setting of the activation, the
-  `gasfree_address` of the reports and the gasless withdraw are available, and
-  that withdraw returns a signed authorization the node does not hand to the
-  provider (CRD ch.63 §63.3.1 to §63.3.6, §63.8A).
+  R21.10B.9, R21.B3). Gasless TRC20 transfers through GasFree are available:
+  the provider setting of the activation, the `gasfree_address` of the
+  reports and the gasless withdraw. The direct `withdraw` returns a signed
+  authorization the node does not hand to the provider; the task form
+  submits it and follows the transfer (CRD ch.63 §63.3.1 to §63.3.6, §63.8A,
+  §63.8B).
 - **A TRON coin answers "not supported" for the EVM-only methods.**
   `get_raw_transaction`, `sign_raw_transaction`,
   `get_eth_estimated_fee_per_gas`, `stream::fee_estimator::enable`,

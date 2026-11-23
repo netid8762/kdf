@@ -4,6 +4,7 @@
 //! # Sub-modules
 //! - `rpc_client` — KDF-original async JSON-RPC client (P14).
 //! - `rpc_pool` — failover-aware multi-endpoint dispatch layer (P14.11).
+//! - `swap_program`, `swap_decode`, `swap_sol` — the SOL legs of the legacy swap (CRD ch.40 §40.6D).
 //! - `solana_types` — constants, traits, errors, `SolanaCoin` struct.
 //! - `solana_common` — shared transfer/balance helpers.
 //! - `solana_helpers` — inherent methods on `SolanaCoin`.
@@ -11,7 +12,8 @@
 //! - `solana_market_ops` — `MarketCoinOps` impl.
 //! - `solana_mm_coin` — `MmCoin` impl plus the SOL-side `withdraw`.
 //! - `spl` — `SplToken` and its `MmCoin` / `MarketCoinOps` impls.
-//! - `solana_decode_tx_helpers` — Solana JSON tx-history decoders.
+//! - `history` — the transaction history of SOL and SPL tokens (CRD ch.40 §40.6C); `history_decode` — its pure
+//!   transaction decoding and row mapping.
 
 pub mod rpc_client;
 pub mod rpc_pool;
@@ -58,7 +60,6 @@ pub(crate) use std::{convert::TryFrom,
 pub mod solana_common;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod solana_common_tests;
-mod solana_decode_tx_helpers;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod solana_disable_coin_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -74,10 +75,21 @@ pub mod spl;
 mod spl_sdk_vectors_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))] mod spl_tests;
 
+mod history;
+mod history_decode;
+pub use history::{solana_history_enabled, spawn_platform_history};
+#[cfg(all(test, not(target_arch = "wasm32")))] mod history_tests;
 mod solana_helpers;
 mod solana_market_ops;
 mod solana_mm_coin;
 mod solana_swap_ops;
 mod solana_types;
+mod swap_decode;
+pub mod swap_program;
+mod swap_sol;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod swap_sol_tests;
+pub use swap_program::WalletOnlyReason;
+pub use swap_sol::{SolanaSwapConfig, SolanaSwapTx, SwapProgramState, SwapSide};
 
 pub use solana_types::*;
