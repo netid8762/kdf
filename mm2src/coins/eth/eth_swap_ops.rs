@@ -1,13 +1,72 @@
 //! SwapOps and WatcherOps trait implementations for EthCoin.
 
 use super::*;
+use crate::eth::tron::swap::send as tron_send;
+use crate::eth::tron::TronAddress;
 use crate::utxo::utxo_common::capped_refund_wait;
 use crate::{wall_clock_refund_eligibility, CanRefundHtlc};
+
+/// The V1 payment of a TRX or TRC20 coin to the swap contract selected for the swap (CRD ch.21 §21.11C, ch.51
+/// R98). The swap id and the contract's hash argument are made from the 32-byte secret hash as it is: this path
+/// never reaches the derivation of the EVM contract's 20-byte value (ch.51 R72A).
+fn tron_payment(
+    coin: &EthCoin,
+    time_lock: u32,
+    secret_hash: &[u8],
+    amount: BigDecimal,
+    receiver: Address,
+    swap_contract: Address,
+) -> TransactionFut {
+    let (coin, secret_hash) = (coin.clone(), secret_hash.to_vec());
+    let receiver = TronAddress::from_evm_address(receiver);
+    let contract = TronAddress::from_evm_address(swap_contract);
+    let fut = async move {
+        tron_send::send_payment(&coin, &contract, &receiver, &secret_hash, time_lock, &amount)
+            .await
+            .map(TransactionEnum::from)
+            .map_err(TransactionErr::from)
+    };
+    Box::new(fut.boxed().compat())
+}
+
+/// Whether the V1 payment of a TRX or TRC20 coin was sent (CRD ch.21 §21.11C R21.11C.13). `terms` are the
+/// receiver and the amount of the payment, when the caller knows them: the stored payment hash is then compared
+/// with the one of these terms.
+fn tron_payment_sent(
+    coin: &EthCoin,
+    time_lock: u32,
+    secret_hash: &[u8],
+    swap_contract_address: &Option<BytesJson>,
+    terms: Option<(Address, BigDecimal)>,
+) -> Box<dyn Future<Item = Option<TransactionEnum>, Error = String> + Send> {
+    let contract = TronAddress::from_evm_address(try_fus!(swap_contract_address.try_to_address()));
+    let (coin, secret_hash) = (coin.clone(), secret_hash.to_vec());
+    let terms = terms.map(|(receiver, amount)| (TronAddress::from_evm_address(receiver), amount));
+    let fut = async move {
+        let terms = terms.as_ref().map(|(receiver, amount)| (receiver, amount));
+        let sent = try_s!(tron_send::my_payment_sent(&coin, &contract, time_lock, &secret_hash, terms).await);
+        Ok(sent.map(TransactionEnum::from))
+    };
+    Box::new(fut.boxed().compat())
+}
 
 #[async_trait]
 impl SwapOps for EthCoin {
     fn send_taker_fee(&self, dex_fee: &DexFee, fee_addr: &[u8], _uuid: &[u8]) -> TransactionFut {
         let address = try_tx_fus!(addr_from_raw_pubkey(fee_addr));
+        // A TRON coin sends a TRX `TransferContract` or a TRC20 `transfer` of the fee, and nothing for a burn
+        // share (CRD ch.21 D21.B9, §21.11C).
+        if self.is_tron_family() {
+            let (coin, dex_fee) = (self.clone(), dex_fee.clone());
+            let fee_address = TronAddress::from_evm_address(address);
+            let fut = async move {
+                tron_send::send_dex_fee(&coin, &fee_address, &dex_fee)
+                    .await
+                    .map(TransactionEnum::from)
+                    .map_err(TransactionErr::from)
+            };
+            return Box::new(fut.boxed().compat());
+        }
         // For EVM coins, only the fee portion is sent on-chain; the burn
         // portion (if any) is implicit — not sent as a separate transfer.
         let amount = dex_fee.fee_amount();
@@ -32,6 +91,9 @@ impl SwapOps for EthCoin {
     ) -> TransactionFut {
         let taker_addr = try_tx_fus!(addr_from_raw_pubkey(taker_pub));
         let swap_contract_address = try_tx_fus!(swap_contract_address.try_to_address());
+        if self.is_tron_family() {
+            return tron_payment(self, time_lock, secret_hash, amount, taker_addr, swap_contract_address);
+        }
 
         Box::new(
             self.send_hash_time_locked_payment(
@@ -57,6 +119,9 @@ impl SwapOps for EthCoin {
     ) -> TransactionFut {
         let maker_addr = try_tx_fus!(addr_from_raw_pubkey(maker_pub));
         let swap_contract_address = try_tx_fus!(swap_contract_address.try_to_address());
+        if self.is_tron_family() {
+            return tron_payment(self, time_lock, secret_hash, amount, maker_addr, swap_contract_address);
+        }
 
         Box::new(
             self.send_hash_time_locked_payment(
@@ -80,6 +145,15 @@ impl SwapOps for EthCoin {
         _htlc_privkey: &[u8],
         swap_contract_address: &Option<BytesJson>,
     ) -> TransactionFut {
+        if self.is_tron_family() {
+            return tron_spend(
+                self,
+                taker_payment_tx,
+                secret,
+                swap_contract_address,
+                tron_watch::ClaimKind::RevealsSecret,
+            );
+        }
         let tx: UnverifiedTransaction = try_tx_fus!(rlp::decode(taker_payment_tx));
         let signed = try_tx_fus!(SignedEthTx::new(tx));
         let swap_contract_address = try_tx_fus!(swap_contract_address.try_to_address(), signed);
@@ -99,6 +173,15 @@ impl SwapOps for EthCoin {
         _htlc_privkey: &[u8],
         swap_contract_address: &Option<BytesJson>,
     ) -> TransactionFut {
+        if self.is_tron_family() {
+            return tron_spend(
+                self,
+                maker_payment_tx,
+                secret,
+                swap_contract_address,
+                tron_watch::ClaimKind::SecretPublic,
+            );
+        }
         let tx: UnverifiedTransaction = try_tx_fus!(rlp::decode(maker_payment_tx));
         let signed = try_tx_fus!(SignedEthTx::new(tx));
         let swap_contract_address = try_tx_fus!(swap_contract_address.try_to_address());
@@ -113,10 +196,13 @@ impl SwapOps for EthCoin {
         taker_payment_tx: &[u8],
         _time_lock: u32,
         _maker_pub: &[u8],
-        _secret_hash: &[u8],
+        secret_hash: &[u8],
         _htlc_privkey: &[u8],
         swap_contract_address: &Option<BytesJson>,
     ) -> TransactionFut {
+        if self.is_tron_family() {
+            return tron_refund(self, taker_payment_tx, secret_hash, swap_contract_address);
+        }
         let tx: UnverifiedTransaction = try_tx_fus!(rlp::decode(taker_payment_tx));
         let signed = try_tx_fus!(SignedEthTx::new(tx));
         let swap_contract_address = try_tx_fus!(swap_contract_address.try_to_address());
@@ -132,10 +218,13 @@ impl SwapOps for EthCoin {
         maker_payment_tx: &[u8],
         _time_lock: u32,
         _taker_pub: &[u8],
-        _secret_hash: &[u8],
+        secret_hash: &[u8],
         _htlc_privkey: &[u8],
         swap_contract_address: &Option<BytesJson>,
     ) -> TransactionFut {
+        if self.is_tron_family() {
+            return tron_refund(self, maker_payment_tx, secret_hash, swap_contract_address);
+        }
         let tx: UnverifiedTransaction = try_tx_fus!(rlp::decode(maker_payment_tx));
         let signed = try_tx_fus!(SignedEthTx::new(tx));
         let swap_contract_address = try_tx_fus!(swap_contract_address.try_to_address());
@@ -147,6 +236,9 @@ impl SwapOps for EthCoin {
     }
 
     fn validate_fee(&self, args: ValidateFeeArgs<'_>) -> Box<dyn Future<Item = (), Error = String> + Send> {
+        if self.is_tron_family() {
+            return tron_validate_fee(self, args);
+        }
         // LP-17: replaces `selfi.web3.eth().transaction(TransactionId::Hash(tx.hash))` with
         // alloy's native `Provider::get_transaction_by_hash`. Wire-level
         // RPC method (`eth_getTransactionByHash`) is unchanged. The
@@ -267,7 +359,7 @@ impl SwapOps for EthCoin {
                 // TRON coins are wallet-only while
                 // `TRON_SWAPS_AVAILABLE` is `false` (CRD ch.21 R-D1, R21.B3), so a swap never reaches this branch.
                 EthCoinType::Tron | EthCoinType::Trc20 { .. } => {
-                    return ERR!("TRON dex-fee validation not yet wired (pending P10.2.5)");
+                    return ERR!("a TRON dex fee is validated by tron::swap::watch before this point");
                 },
             }
 
@@ -277,6 +369,10 @@ impl SwapOps for EthCoin {
     }
 
     fn validate_maker_payment(&self, input: ValidatePaymentInput) -> Box<dyn Future<Item = (), Error = String> + Send> {
+        if self.is_tron_family() {
+            let sender_pub = input.maker_pub.clone();
+            return tron_validate_payment(self, input, sender_pub);
+        }
         let swap_contract_address = try_fus!(input.swap_contract_address.try_to_address());
         self.validate_payment(
             &input.payment_tx,
@@ -289,6 +385,10 @@ impl SwapOps for EthCoin {
     }
 
     fn validate_taker_payment(&self, input: ValidatePaymentInput) -> Box<dyn Future<Item = (), Error = String> + Send> {
+        if self.is_tron_family() {
+            let sender_pub = input.taker_pub.clone();
+            return tron_validate_payment(self, input, sender_pub);
+        }
         let swap_contract_address = try_fus!(input.swap_contract_address.try_to_address());
         self.validate_payment(
             &input.payment_tx,
@@ -309,6 +409,11 @@ impl SwapOps for EthCoin {
         from_block: u64,
         swap_contract_address: &Option<BytesJson>,
     ) -> Box<dyn Future<Item = Option<TransactionEnum>, Error = String> + Send> {
+        // A TRON coin reads `payments(id)` of the selected contract under the 32-byte secret hash (CRD ch.21
+        // §21.11C); a failed read is an error and never "not sent".
+        if self.is_tron_family() {
+            return tron_payment_sent(self, time_lock, secret_hash, swap_contract_address, None);
+        }
         let id = self.etomic_swap_id(time_lock, secret_hash);
         let swap_contract_address = try_fus!(swap_contract_address.try_to_address());
         let selfi = self.clone();
@@ -396,6 +501,35 @@ impl SwapOps for EthCoin {
         Box::new(fut.boxed().compat())
     }
 
+    /// A TRON coin also compares the stored payment hash with the one of the payment this swap would send;
+    /// another hash is a typed error (CRD ch.21 R21.11C.13). An EVM coin
+    /// answers as [`SwapOps::check_if_my_payment_sent`] does.
+    #[allow(clippy::too_many_arguments)]
+    fn check_if_my_payment_sent_for_amount(
+        &self,
+        time_lock: u32,
+        my_pub: &[u8],
+        other_pub: &[u8],
+        secret_hash: &[u8],
+        search_from_block: u64,
+        swap_contract_address: &Option<BytesJson>,
+        amount: &BigDecimal,
+    ) -> Box<dyn Future<Item = Option<TransactionEnum>, Error = String> + Send> {
+        if self.is_tron_family() {
+            let receiver = try_fus!(addr_from_raw_pubkey(other_pub));
+            let terms = Some((receiver, amount.clone()));
+            return tron_payment_sent(self, time_lock, secret_hash, swap_contract_address, terms);
+        }
+        self.check_if_my_payment_sent(
+            time_lock,
+            my_pub,
+            other_pub,
+            secret_hash,
+            search_from_block,
+            swap_contract_address,
+        )
+    }
+
     async fn search_for_swap_tx_spend_my(
         &self,
         _time_lock: u32,
@@ -406,6 +540,11 @@ impl SwapOps for EthCoin {
         search_from_block: u64,
         swap_contract_address: &Option<BytesJson>,
     ) -> Result<Option<FoundSwapTxSpend>, String> {
+        if self.is_tron_family() {
+            return tron_watch::search_for_spend(self, tx, swap_contract_address)
+                .await
+                .map_err(|e| e.to_string());
+        }
         let swap_contract_address = try_s!(swap_contract_address.try_to_address());
         self.search_for_swap_tx_spend(tx, swap_contract_address, search_from_block)
             .await
@@ -421,12 +560,20 @@ impl SwapOps for EthCoin {
         search_from_block: u64,
         swap_contract_address: &Option<BytesJson>,
     ) -> Result<Option<FoundSwapTxSpend>, String> {
+        if self.is_tron_family() {
+            return tron_watch::search_for_spend(self, tx, swap_contract_address)
+                .await
+                .map_err(|e| e.to_string());
+        }
         let swap_contract_address = try_s!(swap_contract_address.try_to_address());
         self.search_for_swap_tx_spend(tx, swap_contract_address, search_from_block)
             .await
     }
 
     fn extract_secret(&self, secret_hash: &[u8], spend_tx: &[u8]) -> Result<Vec<u8>, String> {
+        if self.is_tron_family() {
+            return tron_watch::extract_secret(secret_hash, spend_tx).map_err(|e| e.to_string());
+        }
         let unverified: UnverifiedTransaction = try_s!(rlp::decode(spend_tx));
         match secret_of_claim_call(&unverified.data, secret_hash)? {
             Some(secret) => Ok(secret),
@@ -437,6 +584,11 @@ impl SwapOps for EthCoin {
     /// CRD ch.51 §51.6E R86: the call input first, then the `secret` word of the `ReceiverSpent` logs of the
     /// transaction's receipt. A value is the secret only when it passes the secret-hash rule.
     async fn extract_secret_from_spend(&self, secret_hash: &[u8], spend_tx: &[u8]) -> Result<Vec<u8>, String> {
+        if self.is_tron_family() {
+            return tron_watch::extract_secret_from_spend(self, secret_hash, spend_tx)
+                .await
+                .map_err(|e| e.to_string());
+        }
         use crate::eth::alloy_compat::assert_send_future;
         use alloy::providers::Provider;
 
@@ -483,15 +635,19 @@ impl SwapOps for EthCoin {
         }
     }
 
-    /// The Tron family keeps the wall-clock rule, with no chain read (CRD ch.51 §51.6E R92 item 3). Every other
-    /// EVM coin reads the latest block's timestamp once the local clock is past the lock time
+    /// The Tron family answers with the agreed solidified chain time of `tron::swap::watch` (CRD ch.51 R88, R100).
+    /// Every other EVM coin reads the latest block's timestamp once the local clock is past the lock time
     /// (CRD ch.51 §51.6E R88). A failed read, or a block without a timestamp, is an error.
     fn can_refund_htlc(&self, locktime: u64) -> Box<dyn Future<Item = CanRefundHtlc, Error = String> + Send + '_> {
         let fut = async move {
-            let now = now_ms() / 1000;
             if self.is_tron_family() {
-                return Ok(wall_clock_refund_eligibility(now, locktime));
+                // The agreed solidified chain time against the lock time; undetermined evidence or any failure is
+                // an error, never a refund.
+                return crate::eth::tron::swap::watch::tron_can_refund_htlc(self, locktime)
+                    .await
+                    .map_err(|e| e.to_string());
             }
+            let now = now_ms() / 1000;
             if now < locktime {
                 return Ok(evm_refund_eligibility(now, locktime, None));
             }
@@ -602,14 +758,124 @@ pub(crate) fn evm_refund_eligibility(now: u64, locktime: u64, tip_ts: Option<u64
     }
 }
 
+use crate::eth::tron::swap::watch as tron_watch;
+
+/// A TRON coin's spend of the counterparty's payment (CRD ch.21 §21.11B.2): the call and its confirmation are
+/// `tron::swap::watch`'s.
+fn tron_spend(
+    coin: &EthCoin,
+    payment_tx: &[u8],
+    secret: &[u8],
+    swap_contract: &Option<BytesJson>,
+    kind: tron_watch::ClaimKind,
+) -> TransactionFut {
+    let (coin, payment_tx, secret, swap_contract) = (
+        coin.clone(),
+        payment_tx.to_vec(),
+        secret.to_vec(),
+        swap_contract.clone(),
+    );
+    Box::new(
+        async move {
+            tron_watch::spend_payment(&coin, &payment_tx, &secret, &swap_contract, kind)
+                .await
+                .map(TransactionEnum::from)
+                .map_err(TransactionErr::from)
+        }
+        .boxed()
+        .compat(),
+    )
+}
+
+/// A TRON coin's refund of its own payment.
+fn tron_refund(
+    coin: &EthCoin,
+    payment_tx: &[u8],
+    secret_hash: &[u8],
+    swap_contract: &Option<BytesJson>,
+) -> TransactionFut {
+    let (coin, payment_tx, secret_hash, swap_contract) = (
+        coin.clone(),
+        payment_tx.to_vec(),
+        secret_hash.to_vec(),
+        swap_contract.clone(),
+    );
+    Box::new(
+        async move {
+            tron_watch::refund_payment(&coin, &payment_tx, &secret_hash, &swap_contract)
+                .await
+                .map(TransactionEnum::from)
+                .map_err(TransactionErr::from)
+        }
+        .boxed()
+        .compat(),
+    )
+}
+
+/// A TRON coin's validation of the counterparty's payment, whose sender is `sender_pub`.
+fn tron_validate_payment(
+    coin: &EthCoin,
+    input: ValidatePaymentInput,
+    sender_pub: Vec<u8>,
+) -> Box<dyn Future<Item = (), Error = String> + Send> {
+    let coin = coin.clone();
+    Box::new(
+        async move {
+            let check = tron_watch::PaymentCheck {
+                payment_tx: &input.payment_tx,
+                time_lock: input.time_lock,
+                sender_pub: &sender_pub,
+                secret_hash: &input.secret_hash,
+                amount: &input.amount,
+                swap_contract: &input.swap_contract_address,
+                confirmations: input.confirmations,
+            };
+            tron_watch::validate_payment(&coin, &check)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        .boxed()
+        .compat(),
+    )
+}
+
+/// A TRON coin's validation of the taker's DEX fee.
+fn tron_validate_fee(coin: &EthCoin, args: ValidateFeeArgs<'_>) -> Box<dyn Future<Item = (), Error = String> + Send> {
+    let tx = match args.fee_tx {
+        TransactionEnum::TronTransaction(tx) => tx.clone(),
+        _ => {
+            return Box::new(futures01::future::err(ERRL!(
+                "The fee transaction is not a TRON transaction"
+            )))
+        },
+    };
+    let coin = coin.clone();
+    let (sender_pub, fee_addr_pub) = (args.expected_sender.to_vec(), args.fee_addr.to_vec());
+    let amount = args.dex_fee.fee_amount().to_decimal();
+    let min_block_number = args.min_block_number;
+    Box::new(
+        async move {
+            let check = tron_watch::FeeCheck {
+                fee_tx: &tx,
+                sender_pub: &sender_pub,
+                fee_addr_pub: &fee_addr_pub,
+                amount: &amount,
+                min_block_number,
+            };
+            tron_watch::validate_fee(&coin, &check).await.map_err(|e| e.to_string())
+        }
+        .boxed()
+        .compat(),
+    )
+}
+
 #[cfg(test)]
 mod refund_gate_tests {
     use super::*;
 
     #[test]
-    fn the_tron_family_rule_is_the_wall_clock_rule_around_the_lock_time() {
-        // `can_refund_htlc` answers a Tron-family coin with `wall_clock_refund_eligibility` and no chain read;
-        // the trait default is the same function.
+    fn the_trait_default_is_the_wall_clock_rule_around_the_lock_time() {
+        // The trait default of `can_refund_htlc` is `wall_clock_refund_eligibility`.
         let lock = 5000;
         assert!(matches!(
             wall_clock_refund_eligibility(lock - 1, lock),

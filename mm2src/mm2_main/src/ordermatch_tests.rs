@@ -6217,6 +6217,54 @@ fn order_placement_rejects_a_wallet_only_coin() {
     }
 }
 
+/// A wallet-only coin that would also fail the swap-evidence admission (CRD ch.51 R100 item 4) is refused as
+/// wallet-only: a coin that cannot trade at all is never told to add a node.
+fn wallet_only_ctx_with_failing_admission() -> MmArc {
+    use coins::{lp_register_coin, RegisterCoinParams, SwapEvidencePolicy};
+    use mocktopus::mocking::{MockResult, Mockable};
+
+    TestCoin::swap_evidence_policy.mock_safe(|_| MockResult::Return(SwapEvidencePolicy::Insufficient { hosts: 1 }));
+    let ctx = MmCtxBuilder::new()
+        .with_conf(json::json!({ "coins": [{ "coin": "WALLET", "wallet_only": true }, { "coin": "TRADE" }] }))
+        .into_mm_arc();
+    for ticker in ["WALLET", "TRADE"] {
+        block_on(lp_register_coin(
+            &ctx,
+            TestCoin::new(ticker).into(),
+            RegisterCoinParams {
+                ticker: ticker.to_owned(),
+                tx_history: false,
+            },
+        ))
+        .unwrap_or_else(|e| panic!("cannot register {ticker}: {e}"));
+    }
+    ctx
+}
+
+#[test]
+fn setprice_refuses_a_wallet_only_coin_before_the_swap_evidence_admission() {
+    let ctx = wallet_only_ctx_with_failing_admission();
+    for (base, rel, side) in [("WALLET", "TRADE", "Base"), ("TRADE", "WALLET", "Rel")] {
+        let request: SetPriceReq =
+            json::from_value(json::json!({ "base": base, "rel": rel, "price": 1, "volume": 1 })).unwrap();
+        let err = block_on(create_maker_order(&ctx, request)).unwrap_err();
+        assert!(err.ends_with(&format!("{side} coin WALLET is wallet only")), "{err}");
+    }
+}
+
+#[test]
+fn buy_and_sell_refuse_a_wallet_only_coin_before_the_swap_evidence_admission() {
+    let ctx = wallet_only_ctx_with_failing_admission();
+    for (base, rel, side) in [("WALLET", "TRADE", "Base"), ("TRADE", "WALLET", "Rel")] {
+        let order = |method: &str| json::json!({ "method": method, "base": base, "rel": rel, "price": 1, "volume": 1 });
+        let expected = format!("{side} coin WALLET is wallet only");
+        let err = block_on(sell(ctx.clone(), order("sell"))).unwrap_err();
+        assert!(err.ends_with(&expected), "{err}");
+        let err = block_on(buy(ctx.clone(), order("buy"))).unwrap_err();
+        assert!(err.ends_with(&expected), "{err}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ch.57 T11 -- the field report, end to end (R57.7A.1, R57.7A.4)
 //
@@ -20092,6 +20140,116 @@ mod t05_12b_swap_key_check_tests {
         assert!(
             ASKED.load(Ordering::SeqCst),
             "the start did not ask whether the servers agree"
+        );
+        assert_eq!(crate::mm2::lp_swap::running_swaps_num(&ctx), 0);
+    }
+
+    /// CRD ch.51 R100 item 4: a coin with fewer than two nodes and no `swap_evidence_node` is refused at order
+    /// placement (`setprice`, `buy`, `sell`) with a reason that names `swap_evidence_node`; with the field set (a
+    /// trusted node) the same requests are not refused by the rule.
+    #[test]
+    fn r100_a_one_node_coin_is_refused_at_placement_unless_a_node_is_trusted() {
+        use coins::SwapEvidencePolicy;
+        mock_coins();
+        TestCoin::swap_evidence_policy.mock_safe(|coin| {
+            MockResult::Return(match coin.ticker() {
+                "ETH" => SwapEvidencePolicy::Insufficient { hosts: 1 },
+                _ => SwapEvidencePolicy::TwoNodes {
+                    hosts: vec!["a.test".to_owned(), "b.test".to_owned()],
+                },
+            })
+        });
+        let refusal = "ETH has fewer than two nodes for swap evidence; add a second node or set swap_evidence_node";
+        let ctx = ctx_with(json!({}), false, &["ETH", "KMD"]);
+        let req: SetPriceReq =
+            json::from_value(json!({ "base": "ETH", "rel": "KMD", "price": "1", "volume": "1" })).unwrap();
+        let err = block_on(create_maker_order(&ctx, req)).err().unwrap();
+        assert!(err.ends_with(refusal), "{err}");
+        for method in ["buy", "sell"] {
+            let body = json!({ "base": "ETH", "rel": "KMD", "price": "1", "volume": "1", "method": method });
+            let err = match method {
+                "buy" => block_on(buy(ctx.clone(), body)),
+                _ => block_on(sell(ctx.clone(), body)),
+            }
+            .err()
+            .unwrap();
+            assert!(err.ends_with(refusal), "{method}: {err}");
+        }
+
+        // With the field set the coin answers `Trusted`, and the rule no longer refuses: the placement checks the
+        // same function as the start of a swap, and a test double cannot run an order to its end.
+        let (eth, kmd) = pair("ETH", "KMD");
+        TestCoin::swap_evidence_policy.mock_safe(|coin| {
+            MockResult::Return(if coin.ticker() == "ETH" {
+                SwapEvidencePolicy::Trusted {
+                    node: "a.test:50002".to_owned(),
+                }
+            } else {
+                SwapEvidencePolicy::TwoNodes {
+                    hosts: vec!["a.test".to_owned(), "b.test".to_owned()],
+                }
+            })
+        });
+        assert_eq!(swap_evidence_admission(&eth, &kmd), None);
+        // and the refusal itself, for the same pair, before the field is set
+        TestCoin::swap_evidence_policy.mock_safe(|_| MockResult::Return(SwapEvidencePolicy::Insufficient { hosts: 1 }));
+        assert_eq!(
+            swap_evidence_admission(&eth, &kmd).as_deref(),
+            Some("ETH has fewer than two nodes for swap evidence; add a second node or set swap_evidence_node")
+        );
+    }
+
+    /// R100 tie for Solana: the table says `SwapsOff` exactly while the untradable rule refuses a Solana coin
+    /// (the other `SwapsOff` families are tied to their switches in `coins::swap_evidence`).
+    #[test]
+    fn r100_swaps_off_for_solana_follows_the_untradable_rule() {
+        use coins::swap_evidence::{adoption_of, R100Adoption, SwapFamily};
+        let ctx = MmCtxBuilder::new()
+            .with_conf(json!({ "coins": [
+                { "coin": "SOL", "protocol": { "type": "SOLANA" } },
+                { "coin": "USDC-SOL", "protocol": { "type": "SPLTOKEN" } },
+            ] }))
+            .into_mm_arc();
+        let swaps_off = ["SOL", "USDC-SOL"]
+            .iter()
+            .all(|ticker| untradable_reason_by_conf(&ctx, ticker) == Some("Solana"));
+        let adoption = adoption_of(SwapFamily::Solana);
+        if adoption == Some(R100Adoption::SwapsOff) {
+            assert!(swaps_off, "Solana is marked SwapsOff but its coins can trade");
+        }
+        if !swaps_off {
+            assert!(
+                adoption != Some(R100Adoption::SwapsOff),
+                "Solana swaps are on but the family is marked SwapsOff"
+            );
+        }
+    }
+
+    /// CRD ch.51 R100 item 4: the swap start of a matched order is refused for a coin with fewer than two nodes and
+    /// no `swap_evidence_node`; no swap starts. (The start runs on the test thread, where the mock holds.)
+    #[test]
+    fn r100_a_one_node_coin_starts_no_new_swap() {
+        use coins::SwapEvidencePolicy;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static ASKED: AtomicBool = AtomicBool::new(false);
+        mock_coins();
+        TestCoin::swap_evidence_policy.mock_safe(|coin| {
+            MockResult::Return(if coin.ticker() == "JST" {
+                ASKED.store(true, Ordering::SeqCst);
+                SwapEvidencePolicy::Insufficient { hosts: 1 }
+            } else {
+                SwapEvidencePolicy::TwoNodes {
+                    hosts: vec!["a.test".to_owned(), "b.test".to_owned()],
+                }
+            })
+        });
+        let ctx = ctx_with(json!({}), false, &["ETH", "JST"]);
+        let maker_order: MakerOrder = json::from_str(MATCHED_ORDER_JSON).unwrap();
+        let maker_match = maker_order.matches.values().next().cloned().unwrap();
+        block_on(maker_swap_start(ctx.clone(), maker_match, maker_order));
+        assert!(
+            ASKED.load(Ordering::SeqCst),
+            "the start did not ask for the swap-evidence policy"
         );
         assert_eq!(crate::mm2::lp_swap::running_swaps_num(&ctx), 0);
     }

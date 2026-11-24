@@ -1793,6 +1793,7 @@ impl EthCoin {
             gas_station_policy: self.gas_station_policy.clone(),
             web3: token_node_provider(&self.web3),
             web3_instances: self.web3_instances.clone(),
+            swap_evidence: self.swap_evidence.clone(),
             history_sync_state: Mutex::new(HistorySyncState::NotEnabled),
             ctx: self.ctx.clone(),
             required_confirmations: required_confirmations.into(),
@@ -2683,12 +2684,10 @@ impl EthCoin {
                     U256::from(self.gas_limit.eth_send_erc20),
                 )
             },
-            // TRON has its own transfer pipeline (build TransactionRaw,
-            // sign with SHA-256+secp256k1, broadcast via TronApiClient).
-            // TRON coins are wallet-only while
-            // `TRON_SWAPS_AVAILABLE` is `false` (CRD ch.21 R-D1, R21.B3), so a swap never reaches this branch.
+            // A TRON transfer is a signed protobuf transaction, which this function's EVM transaction type cannot
+            // carry. The swap's DEX fee of a TRON coin is sent by `tron::swap::send` (CRD ch.21 §21.11C).
             EthCoinType::Tron | EthCoinType::Trc20 { .. } => Box::new(futures01::future::err(TransactionErr::Plain(
-                ERRL!("TRON send_to_address not yet wired (pending P10.2.5)"),
+                ERRL!("A TRON coin does not send through the EVM transfer path"),
             ))),
         }
     }
@@ -2769,11 +2768,10 @@ impl EthCoin {
                     }
                 }))
             },
-            // V1 Ethereum HTLC swaps; TRON uses a separate atomic-swap flow.
-            // TRON coins are wallet-only while
-            // `TRON_SWAPS_AVAILABLE` is `false` (CRD ch.21 R-D1, R21.B3), so a swap never reaches this branch.
+            // A TRON payment is a signed protobuf transaction, which this function's EVM transaction type cannot
+            // carry. The swap's payment of a TRON coin is sent by `tron::swap::send` (CRD ch.21 §21.11C).
             EthCoinType::Tron | EthCoinType::Trc20 { .. } => Box::new(futures01::future::err(TransactionErr::Plain(
-                ERRL!("TRON HTLC payment not yet wired (pending P10.2.5)"),
+                ERRL!("A TRON coin does not send its payment through the EVM payment path"),
             ))),
         }
     }
@@ -2862,7 +2860,7 @@ impl EthCoin {
             },
             // V1 Ethereum HTLC swaps; TRON path is gated. P10.2.5.
             EthCoinType::Tron | EthCoinType::Trc20 { .. } => Box::new(futures01::future::err(TransactionErr::Plain(
-                ERRL!("TRON HTLC spend not yet wired (pending P10.2.5)"),
+                ERRL!("a TRON spend is sent by tron::swap::watch before this point"),
             ))),
         }
     }
@@ -2950,7 +2948,7 @@ impl EthCoin {
             // V1 Ethereum HTLC refund; TRON refund is a separate flow. TRON coins are wallet-only while
             // `TRON_SWAPS_AVAILABLE` is `false` (CRD ch.21 R-D1, R21.B3), so a swap never reaches this branch.
             EthCoinType::Tron | EthCoinType::Trc20 { .. } => Box::new(futures01::future::err(TransactionErr::Plain(
-                ERRL!("TRON HTLC refund not yet wired (pending P10.2.5)"),
+                ERRL!("a TRON refund is sent by tron::swap::watch before this point"),
             ))),
         }
     }
@@ -3419,7 +3417,7 @@ impl EthCoin {
                 // separate validator. TRON coins are wallet-only while
                 // `TRON_SWAPS_AVAILABLE` is `false` (CRD ch.21 R-D1, R21.B3), so a swap never reaches this branch.
                 EthCoinType::Tron | EthCoinType::Trc20 { .. } => {
-                    return ERR!("TRON HTLC payment validation not yet wired (pending P10.2.5)");
+                    return ERR!("a TRON payment is validated by tron::swap::watch before this point");
                 },
             }
 
@@ -3466,7 +3464,7 @@ impl EthCoin {
             // TRON coins are wallet-only while
             // `TRON_SWAPS_AVAILABLE` is `false` (CRD ch.21 R-D1, R21.B3), so a swap never reaches this branch.
             EthCoinType::Tron | EthCoinType::Trc20 { .. } => {
-                return ERR!("TRON spend search not yet wired (pending P10.2.5)");
+                return ERR!("a TRON spend is searched by tron::swap::watch before this point");
             },
         };
 

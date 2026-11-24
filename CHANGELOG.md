@@ -14,6 +14,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 Read this before you upgrade. It lists every change in this release that an older version can no longer read
 or undo, and every change that needs a step from you.
 
+- **A new swap needs two nodes of the coin that agree, or one node you name as trusted.** Before a swap refunds, or
+  uses the swap's secret, the chain reads that step rests on (the other side's payment, whether a payment was
+  claimed, refunded or not spent, and the chain time of the refund) must agree between two nodes of the coin. Two
+  ports of one host are one node; two hosts of one operator are two nodes. A coin in native mode is served by your
+  own daemon and needs nothing.
+  - *What changes:* a coin with fewer than two distinct hosts in its server or node list, and no
+    `swap_evidence_node`, starts no new swap: `setprice`, `buy`, `sell` and the swap start refuse it with a
+    reason that names `swap_evidence_node`. A swap that is already running when you upgrade keeps running, but a
+    step whose reads do not agree, or that has too few answers, waits and logs how to fix it; it never refunds or
+    claims on such a read. A refund step waits like this until an hour after the refund first became possible in
+    the current run, and at least until its payment's lock time plus 3700 seconds; a swap still waiting then ends
+    as refund failed, with a text that names the kind of failure and, for reads that did not agree, the fix; after
+    fixing the node list, or once the coin answers again, you run `recover_funds_of_swap`.
+  - *What to do:* list a server on a second host in the activation request, or set the new activation field
+    `swap_evidence_node` to one entry of the coin's own list to trust that node alone. When the trusted node does
+    not answer, the step waits; no other node is asked in its place.
+  - *Coin families covered* (the rule is switched on family by family as each family's chain reads move onto it):
+    - TRON (TRX, TRC20). TRON swaps stay off in this release; when they are switched on, their chain reads already
+      follow the rule. Detail: PR #509; CRD ch.21 §21.11D.
+  - Detail: PR #508; CRD ch.51 §51.6G R100.
 - **A swap database written by a newer version is refused at start-up.** When the migration state recorded in
   `MM2.db` is above the highest state this build knows (15), start-up stops with an error that names both numbers,
   instead of running on a database layout it does not know. No released version of KDF Reloaded or GLEEC KDF records
@@ -43,7 +63,7 @@ or undo, and every change that needs a step from you.
   - *Before you upgrade:* make your own copy of the wallet database file and of the seed or passphrase as for any
     upgrade; the steps under "Coins that are no longer visible after an upgrade" below apply if a coin is no longer
     shown afterwards.
-  Detail: PR #411; CRD ch.39 R39.8.0ba, R39.8.0bc and the status note of 2026-11-18; RELOADED_VS_GLEEC.md.
+  - Detail: PR #411; CRD ch.39 R39.8.0ba, R39.8.0bc and the status note of 2026-11-18; RELOADED_VS_GLEEC.md.
 - **Under an HD login, `priv_key_policy: IguanaPrivKey` now selects the node's single internal key for Tendermint
   coins, EVM coins and their tokens, BCH with its SLP tokens, Sia, Lightning and shielded coins such as ARRR.** Until
   now these families ignored the value: Tendermint and EVM coins used their HD key at `path_to_address`, Sia its fixed
@@ -68,6 +88,7 @@ or undo, and every change that needs a step from you.
     `priv_key_policy` out or send `ContextPrivKey`. If coins are not visible after the upgrade, read "Coins that are
     no longer visible after an upgrade" below and start the previous version again before you move or spend
     anything. A hardware value fails the request, where it used to be ignored.
+  - Detail: PRs #400, #414; CRD ch.05 R46 and its status notes of 2026-11-17 and 2026-11-18, ch.39 R39.8.0bd.
 - **ZEC sends need the coins entry with `"txversion": 5` and `"consensus_branch_id": "77190ad9"`** (the branch id is
   accepted with or without `0x`). Since the Zcash network upgrade NU7 the network refuses version-4 transactions. This
   release builds version-5 ZEC transactions when the ZEC entry says `txversion` 5; with the old entry (`txversion` 4) every
@@ -77,13 +98,14 @@ or undo, and every change that needs a step from you.
   entry: an invalid consensus branch id).
   - *Activation:* a Zcash-family (`overwintered`) entry whose `txversion` is not 4 or 5, and a version-5 entry without
     `consensus_branch_id`, are now refused with an error that names the field.
-
+  - Detail: PR #404; CRD ch.39 R39.11.15 and the §39.11.4V status notes.
 - **WalletConnect sessions paired with an earlier version must be paired again.** The node now keeps one relay
   identity across reconnects and restarts. Sessions made by an earlier version were made under a different identity,
   so the relay refuses requests on them after the upgrade: remove them in the wallet and pair again.
   - *Browser (WASM) builds:* the WalletConnect store in the browser is upgraded to a new format at the first start.
     An earlier version can no longer open it. To go back to an earlier version, clear this site's WalletConnect data
     in the browser first, then pair again.
+  - Detail: PR #393; CRD ch.22 §22.5.2.
 - **`disable_coin` of a platform coin that has active tokens no longer removes it.** The legacy `disable_coin`
   now makes such a platform coin passive and answers `passivized: true`: its tokens stay active, and every
   method that needs an active coin answers as if the platform were not activated. Before, the call removed the
@@ -109,7 +131,6 @@ or undo, and every change that needs a step from you.
   - *What to do:* disable the token first, leave it out of the request, or set `reactivation_registered_token` to
     `"keep"` in `MM2.json` (see "Added" below).
   - Detail: PR #432; CRD ch.43 §43.1F R43.1F.4.
-
 - **RPC answers no longer have `<`, `>` and `&` replaced by `&lt;`, `&gt;` and `&amp;`.** Answers are sent as the
   handler produced them. A client that decoded those entities itself to get the original text must stop doing so,
   or it will now change text that really contains such a sequence.
@@ -122,6 +143,7 @@ or undo, and every change that needs a step from you.
   confirm its absence. This can happen to a transaction of a chain branch that was later abandoned. A transaction the
   servers now report at another height shows that height and its block's time.
   - *What you see:* an existing history can lose rows or show changed heights. Nothing needs to be done.
+  - Detail: PR #408; CRD ch.38 §38.5C, D38.5C.1 and D38.5C.2.
 - **A Kerrigan (KRGN) coin entry needs `"chain_variant": "KRGN"` in its `protocol` object.** Without it, the
   coin's Electrum headers cannot be read, so its median block time is almost always unknown, and claims and refunds
   of a KRGN swap fail, as they did before this release. With the value, the headers are read and claims and refunds
@@ -211,6 +233,12 @@ the previous version used. The safe way:
     during the balance query does the same, and cancelling it before the device confirmed records nothing.
   Detail: PR #491; CRD ch.49 §49.2.3 (the status note "the task form of `get_new_address` (as built)"), ch.05 R54;
   the maintainer decided on 2026-11-22 on the divergences.
+- **New optional activation field `swap_evidence_node`.** It names one node of the coin's own list as the node whose
+  answer alone a swap acts on (see the breaking change about two nodes above). Every coin family that can swap
+  accepts it: UTXO, BCH and SLP, QTUM and QRC20, EVM and ERC20, ZHTLC, Sia and Tendermint, in the legacy and in the
+  task-based activation methods. A value that names no entry of the coin's list is refused with the `error_type`
+  `SwapEvidenceNodeNotInList`, whose data and message name the ticker and the node as host and port only. Detail: PR
+  #508; CRD ch.51 §51.6G R100 item 2.
 - **The legacy `disable_coin` makes a platform coin with active tokens passive, answers `passivized`, and takes
   `force_disable`.** A platform coin (an EVM, BCH, Tendermint, Solana or standard UTXO coin) that has at least one
   active token or layer-two coin, activated by a token activation method or as part of a platform-with-tokens
@@ -546,6 +574,17 @@ the previous version used. The safe way:
   legacy swap's choice of the secret-hash width selects SHA-256 over 32 bytes for such a pair, as the TRON swap
   contract requires; ETH and ERC20 pairs keep the 20-byte hash. TRON swaps stay off, so nothing a user can run
   changes yet. Detail: PR #499; CRD ch.51 R72 status note, ch.21 R21.B6.
+- **The warning about `swap_contract_address` at a legacy TRON activation has a new text.** A TRON coin is still
+  wallet-only and still ignores the swap contracts of an `enable` or `electrum` request. The log line now reads
+  "swap_contract_address is ignored, the coin is wallet-only". Nothing else changes for a user: the groundwork for
+  TRON swaps added here (the contract interface, the transaction form and the contract binding at activation) is not
+  used by any order or swap while TRON swaps are off. Detail: PR #506; CRD ch.21 §21.11C, R21.B2.
+- **A TRON platform accepts `swap_evidence_node` at activation.** The field names one node of the request's own
+  node list to trust for swap evidence instead of the two-node agreement (see "Breaking changes and upgrade
+  notes"); a value that is not in the list refuses the activation with `SwapEvidenceNodeNotInList`. TRON swaps stay
+  off: the part of a TRON swap that reads the chain (checking the other side's payment and the DEX fee, this node's
+  claim and refund, the refund time, the search for a claim and its secret) is built and waits for the switch-on.
+  Detail: PR #509; CRD ch.21 §21.11D.
 
 #### Tendermint (Cosmos) coins
 
@@ -867,6 +906,18 @@ the previous version used. The safe way:
   status note of 2026-11-22;
   `vendor-patches/libp2p-noise-0.43.0/PATCH-NOTES.md`.
 
+#### Swap protocol v2
+
+- **A v2 swap never refunds after its own claim, repeats a chain search after a node error, and takes an EVM secret
+  only when it matches the secret hash.** After the node's own claim of the other side's payment is broadcast, the
+  swap reads its confirmation again every 10 seconds and ends as completed when it is read. It waits until 3700
+  seconds past the lock time of its own payment, and at least 3700 seconds from the start of that wait (a restart
+  starts the wait anew); then it ends as aborted with a reason whose text names the claim transaction. The maker's
+  search for the spend of the taker funding treats an unreachable node, or a node answer that cannot be decoded, as
+  a passing error on every coin family and searches again after 30 seconds. On EVM coins the value read from the
+  spend of the taker payment is used as the secret only when its hash equals the swap's secret hash.
+  - Detail: PR #532; CRD ch.52 R18, R19, R32, R33 and their status notes of 2026-11-23, ch.51 §51.6G R100.
+
 ### Fixed
 
 #### Orders
@@ -879,6 +930,11 @@ the previous version used. The safe way:
   such an order with `cancel_order`, which still sends its cancel message. A kept taker order still times out as
   before: fill-or-kill is removed, good-till-cancelled becomes a maker order that is kept and not announced.
   Detail: PR #485; CRD ch.60 R60.6.5.
+- **A wallet-only coin is refused as wallet-only before the two-node check.** `setprice`, `buy` and `sell` with a
+  coin that cannot trade (a wallet-only coin, every TRON coin while TRON swaps are off) now answer the wallet-only
+  error first. Before, a coin that also had fewer than two nodes was told to add a node or set `swap_evidence_node`
+  (see the R100 item under "Breaking changes and upgrade notes"), which would not have made it tradable.
+  Detail: PR #509.
 
 #### EVM, BCH, Sia and Lightning coins
 
@@ -928,6 +984,10 @@ the previous version used. The safe way:
   Lightning coin aborted the node when they were reached; each now answers an error. Orders and trade previews with
   a Lightning coin were already refused. The public key of a Lightning coin, which `get_private_keys` reads, is its
   node id. Detail: PR #479.
+- **Under an HD login the Sia activation answer now lists the coin's address.** The answer of
+  `task::enable_sia` is the per-account report under an HD login, but it listed account 0 with no
+  address. It now lists account 0 with its single address, the one the coin uses, and that address's
+  balance. Detail: PR #402; CRD ch.46 R46.2.4.
 
 #### WalletConnect
 
@@ -962,6 +1022,11 @@ the previous version used. The safe way:
 - **Sending a Tendermint transaction the node already holds answers its hash.** A repeated
   `send_raw_transaction` was answered with an error ("tx already exists in cache") although the transaction
   was included. Detail: PR #393; CRD ch.36 R36.14.15.
+- **A Tendermint node that accepts a request and never answers no longer holds it forever.** Every request of the
+  native build to a Tendermint node is now bounded at 30 seconds, the node health checks included. A node that does
+  not answer in time counts as failed, so the node choice moves on to the next configured node, and the history
+  stops waiting on it. With no node answering, the request fails after at most about a minute per configured node.
+  Detail: PR #516; CRD ch.36, status note after R36.14.33.
 
 #### ZEC
 
@@ -1010,7 +1075,7 @@ the previous version used. The safe way:
   it now imports `kdflib.js`. The build guide and the page's README name the files the build writes,
   and the build output directory `wasm_build/deps/` is ignored by git. Detail: PR #374; CRD ch.2 directory table (lists `wasm_build/`).
 
-#### Electrum servers
+#### UTXO coins and Electrum
 
 - **A swap no longer times out waiting for confirmations on an Electrum server that has fallen behind or keeps
   answering errors, and a taker whose payment the maker already claimed now finds that claim on any of the coin's
@@ -1034,6 +1099,13 @@ the previous version used. The safe way:
   for a coin without a block time in its coins entry). A server that keeps sending notifications
   without reaching that block now counts as stuck too. A coin with a single connected server keeps
   the old rule. Detail: PR #378; CRD ch.38 R38.6.4o item 4.
+- **KRGN swaps can claim and refund over Electrum.** Kerrigan headers are 80, 124, 543 or 1487 bytes long,
+  depending on the mining algorithm, and two of the four layouts carry the block time 32 bytes later than the
+  standard header. The node could not read them, so the median block time a claim or refund needs was almost
+  always unknown, and KRGN claims and refunds failed with an error, including refunds through
+  `recover_funds_of_swap`. With `"chain_variant": "KRGN"` in the coin's entry, each header is now read by its
+  algorithm. A node connected to a Kerrigan daemon instead of Electrum was not affected. Detail: PR #468; CRD ch.37
+  §37.5.11.
 
 #### Transaction history
 
@@ -1080,23 +1152,6 @@ the previous version used. The safe way:
   server with the ones it already holds. When they differ, the history collectors run at once instead of waiting for a
   balance change, and one WARN line names the height from which the chain changed. At most one small request is made
   per new block. Detail: PR #409; CRD ch.38 §38.5C (the amendment after D38.5C.2).
-
-#### Kerrigan (KRGN)
-
-- **KRGN swaps can claim and refund over Electrum.** Kerrigan headers are 80, 124, 543 or 1487 bytes long,
-  depending on the mining algorithm, and two of the four layouts carry the block time 32 bytes later than the
-  standard header. The node could not read them, so the median block time a claim or refund needs was almost
-  always unknown, and KRGN claims and refunds failed with an error, including refunds through
-  `recover_funds_of_swap`. With `"chain_variant": "KRGN"` in the coin's entry, each header is now read by its
-  algorithm. A node connected to a Kerrigan daemon instead of Electrum was not affected. Detail: PR #468; CRD ch.37
-  §37.5.11.
-
-#### Siacoin
-
-- **Under an HD login the Sia activation answer now lists the coin's address.** The answer of
-  `task::enable_sia` is the per-account report under an HD login, but it listed account 0 with no
-  address. It now lists account 0 with its single address, the one the coin uses, and that address's
-  balance. Detail: PR #402; CRD ch.46 R46.2.4.
 
 #### Solana coins
 
@@ -1199,6 +1254,17 @@ the previous version used. The safe way:
   it sent nothing. Now a disabled instance records nothing, and a subscription is skipped only while it is placed
   over the current connection. One instance sends at most one request per subscription at a time. Detail: PR #473;
   CRD ch.38 status note of 2026-11-22 after D38.6.4Q.1.
+- **The Electrum client no longer sends a second subscription on the same connection, and no longer forgets a
+  subscription that a reconnect placed while a request for it was failing.** After a connection is opened, the client
+  places its remembered subscriptions on it again. That step also sent a subscription that a coin had just placed
+  on the same connection itself, so the server got it twice; this could happen right after activation. And when a
+  coin's first request for a subscription was still waiting while the connection changed, the client placed the
+  subscription on the new connection; if the waiting request then failed, the client forgot the subscription
+  although the server held it, and it was not placed again after later reconnects. Now a subscription that is
+  already placed on the current connection is not sent again, and a failed first request keeps the subscription
+  when it is placed on the current connection. This applies to the address and token balance subscriptions of
+  UTXO coins, QTUM and QRC20 tokens on Electrum. Detail: PR #520; CRD ch.38 status note of 2026-11-23 after
+  D38.6.4Q.1.
 
 #### TRON coins
 
@@ -1214,9 +1280,10 @@ the previous version used. The safe way:
   `sign_raw_transaction` no longer waits for a nonce first), `get_eth_estimated_fee_per_gas` with
   `CoinNotSupported` (HTTP 501), `stream::fee_estimator::enable` with `NotSupportedFor` (HTTP 501, no streamer
   is started), `get_token_info` for an `ERC20` protocol on a TRON platform with `UnsupportedTokenProtocol`
-  (HTTP 400), the legacy `get_trade_fee` with the text "TRON trade fee is not supported", and `trade_preimage`
-  with a TRON coin on the receiving side with `InternalError` and the text "TRON V1 receiver trade fee is not
-  supported". EVM coins are unchanged. Detail: PR #469; CRD ch.21 §21.11 (D7).
+  (HTTP 400), and, for a TRON coin without a swap contract, which is every TRON coin while TRON swaps are off,
+  the legacy `get_trade_fee` and `trade_preimage` with that coin on the receiving side (`InternalError`), both
+  with the text "the coin has no swap contract: it cannot trade". EVM coins are unchanged. Detail: PRs #469,
+  #506; CRD ch.21 §21.11 (D7).
 
 #### Swap and order records
 
@@ -1268,9 +1335,30 @@ the previous version used. The safe way:
   swap event to the contract call it belongs to, requires that call to the swap contract to have succeeded, and
   looks for a refund in the history of the payment's sender, so a refund of the other side's payment is found too.
   Detail: PR #496; CRD ch.51, status note of 2026-11-22 after §51.6E R92.
+- **The taker's refund waits while the chain's answer about its payment is undetermined.** Before it refunds, the
+  taker looks for a claim or a refund of its payment. On every coin, while a look fails or does not finish, and on
+  a coin whose reads need two agreeing nodes also while they do not agree, the refund waits and the look repeats,
+  with one warning. The look also runs each time the refund becomes possible, just before the refund is built. A
+  claim found on one server whose secret matches the swap's hash is used at once; a refund, or another spend, found
+  on one server only is not acted on. A swap still waiting an hour after its refund first became possible in the
+  current run, and at least until its payment's lock time plus 3700 seconds, ends as refund failed, with a text
+  that names the kind of failure and, when the nodes did not agree, the fix; the servers' own answers go to the
+  debug log only. Detail: PR #523; CRD ch.51, status note of 2026-11-23 under R31a.
+- **The maker's refund, the watcher and the payment checks wait on an undetermined answer.** The maker's refund
+  waits while its look at the taker payment, or the check whether the refund is possible, does not give a
+  determined answer, with the same bound and the same kind of text as the taker's. A watcher refunds the taker
+  payment only after a search that answered that the payment is not spent. When the check of the other side's
+  payment cannot be determined, the maker and the taker repeat it until the step's existing deadline instead of
+  giving up at once. The manual recovery names the fix when its read is undetermined. Detail: PR #527; CRD ch.51,
+  status notes of 2026-11-23 after the description of the maker's validation stage, after R28 and at the end of
+  §51.6C; ch.09, status note of 2026-11-23 after §9.6.
 
 ### Tests
 
+- **A Tendermint history test no longer hangs when the whole `coins` test suite runs in parallel.** Once a test
+  stopped a scripted node, its port was free, and another test could be given it; a request to the stopped node
+  then reached a listener that never answered. On Linux a stopped scripted node now keeps its port until the test
+  ends, so connections to it are refused. No production code changes. Detail: PR #513.
 - **The `get_private_keys` warning tests no longer fail when the whole `coins` test suite runs in parallel.** The
   test log capture is one list for the whole process, and another test writes the same warning line, so the line
   counts of the per-call warning test were sometimes off. Each captured line now records the thread that wrote it,
@@ -1370,9 +1458,22 @@ the previous version used. The safe way:
   standalone-coin family are built only for native targets, like the test helpers they use. A new CI job,
   `wasm32-test-check`, compiles the test code of `coins_activation`, `coins` and `mm2_main` for wasm32 and is part
   of the required `tests-passed` check. Only test code and CI changed. Detail: PR #511.
+- **The Windows CI jobs install a pinned protoc.** After a package-manager install of protoc, the build script of
+  `coins` at times did not find protoc. The Windows test job and the Windows build now download protoc 27.3, check
+  the archive's SHA-256, set `PROTOC` to its path and check the version before the build. Only CI changed.
+  Detail: PR #517.
 
 ### Plans touched
 
+- [`swap-v2-chain-read-agreement`](docs/plans/swap-v2-chain-read-agreement.md) — new, planning: swap protocol v2
+  follows the agreement of chain reads (R100) in 0.5.0, with the recovery and the funding-refund rules decided on
+  2026-11-23, PR #528.
+- [`swap-v2-state-and-abort-reason-naming`](docs/plans/swap-v2-state-and-abort-reason-naming.md) — new, planning
+  (after 0.5.0): a decision, with wallet maintainers, on renaming or adding swap protocol v2 states and abort
+  reasons, then compatibility, migration of stored rows and docs; PR #531.
+- [`swap-recovery-retry-switch`](docs/plans/swap-recovery-retry-switch.md) — new, planning (v0.6): a decision,
+  after a discussion with experienced users, on whether an operator or frontend switch retries the recovery of
+  swaps that end needing manual recovery; added with the R100 item 9 note, PR #518.
 - [`tron-swap-support`](docs/plans/tron-swap-support.md) — note of 2026-11-22: the TRON arm of the secret-hash
   selection is built, in PR #499.
 - [`qtum-qrc20-stabilization`](docs/plans/qtum-qrc20-stabilization.md) — in progress: P9, the lab rows, all passed;
@@ -1393,9 +1494,9 @@ the previous version used. The safe way:
 - [`qtum-qrc20-stabilization`](docs/plans/qtum-qrc20-stabilization.md) — in progress: Phase A (reproduce and measure)
   done in PRs #385 and #406; its gate is met; the balance stream's in-node subscription test skipped, with the reason in
   the plan.
-- [`hd-key-unification`](docs/plans/hd-key-unification.md) — the H7 row and Decision CB note now say that H7 applies to an absent
-  `priv_key_policy` or `ContextPrivKey` only, and that `IguanaPrivKey` stays on the internal key in every family;
-  shielded coins read `priv_key_policy` as well (H7 row note of 2026-11-18).
+- [`hd-key-unification`](docs/plans/hd-key-unification.md) — the H7 row and the note on the legacy-route decision now
+  say that H7 applies to an absent `priv_key_policy` or `ContextPrivKey` only, and that `IguanaPrivKey` stays on the
+  internal key in every family; shielded coins read `priv_key_policy` as well (H7 row note of 2026-11-18).
 - [`browser-build-gaps`](docs/plans/browser-build-gaps.md) — new, planning: the gaps of the browser (WASM)
   build outside the shielded coins — versioned history, wallet management, event delivery to the page and
   smaller items — in order of cost, and the limits a browser has by nature, also listed in

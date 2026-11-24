@@ -74,6 +74,7 @@ fn eth_coin_for_test_with_netid_and_decimals(
 ) -> (MmArc, EthCoin) {
     let web3 = crate::eth::alloy_compat::build_provider(crate::node_url::listed_nodes("TEST", urls), vec![]).unwrap();
     let web3_instances = vec![Web3Instance {
+        url: String::new(),
         web3: web3.clone(),
         is_parity: true,
     }];
@@ -110,6 +111,7 @@ pub(super) fn eth_coin_for_test_with_providers(
 
     let my_addr = key_pair.address();
     let eth_coin = EthCoin(Arc::new(EthCoinImpl {
+        swap_evidence: crate::SwapEvidencePolicy::NotAdopted,
         coin_type,
         decimals,
         gas_station_url: None,
@@ -205,6 +207,7 @@ fn eth_hd_coin_for_test(coin_type: EthCoinType) -> (MmArc, EthCoin, Address) {
         EthCoinType::Tron | EthCoinType::Trc20 { .. } => panic!("TRON not used in this test helper"),
     };
     let eth_coin = EthCoin(Arc::new(EthCoinImpl {
+        swap_evidence: crate::SwapEvidencePolicy::NotAdopted,
         coin_type,
         decimals: 18,
         gas_station_url: None,
@@ -218,6 +221,7 @@ fn eth_hd_coin_for_test(coin_type: EthCoinType) -> (MmArc, EthCoin, Address) {
         fallback_swap_contract: None,
         ticker,
         web3_instances: vec![Web3Instance {
+            url: String::new(),
             web3: web3.clone(),
             is_parity: true,
         }],
@@ -393,6 +397,7 @@ fn test_wait_for_payment_spend_timeout() {
 
     let my_addr = key_pair.address();
     let coin = EthCoinImpl {
+        swap_evidence: crate::SwapEvidencePolicy::NotAdopted,
         coin_type: EthCoinType::Eth,
         decimals: 18,
         gas_station_url: None,
@@ -406,6 +411,7 @@ fn test_wait_for_payment_spend_timeout() {
         fallback_swap_contract: None,
         ticker: "ETH".into(),
         web3_instances: vec![Web3Instance {
+            url: String::new(),
             web3: web3.clone(),
             is_parity: true,
         }],
@@ -577,6 +583,7 @@ mod search_for_swap_tx_spend_scripted {
         let swap_contract_address = Address::from_str(SWAP_CONTRACT_ADDR).unwrap();
         let my_addr = key_pair.address();
         let coin = EthCoin(Arc::new(EthCoinImpl {
+            swap_evidence: crate::SwapEvidencePolicy::NotAdopted,
             coin_type,
             decimals: 18,
             gas_station_url: None,
@@ -590,6 +597,7 @@ mod search_for_swap_tx_spend_scripted {
             fallback_swap_contract: None,
             ticker: ticker.into(),
             web3_instances: vec![Web3Instance {
+                url: String::new(),
                 web3: web3.clone(),
                 is_parity: true,
             }],
@@ -790,12 +798,14 @@ mod search_for_swap_tx_spend_scripted {
         assert!(answer.is_err());
     }
 
+    /// A Tron-family coin is answered by the TRON watch side (`tron::swap::watch_tests` pins its answers); a coin
+    /// without a node client has no answer, and the EVM node is not asked.
     #[test]
-    fn refund_gate_of_the_tron_family_asks_no_node() {
+    fn refund_gate_of_the_tron_family_is_an_error_without_a_tron_node() {
         let locktime = now_ms() / 1000 - 7200;
         let (answer, asked) = refund_gate(EthCoinType::Tron, locktime, Some(locktime - 5000));
         assert!(asked.is_empty(), "{asked:?}");
-        assert!(matches!(answer, Ok(CanRefundHtlc::CanRefundNow)));
+        assert!(answer.is_err());
     }
 
     #[test]
@@ -2869,16 +2879,21 @@ fn polygon_check_if_my_payment_sent() {
         "swap_contract_address": "0x9130b257d37a52e52f21054c4da3450c72f595ce",
     });
 
+    // The node URL can carry an API key, and an error from a call to the node can
+    // carry that URL. So no assert or panic message in this test prints an error
+    // text: every `Result` of a network call is matched and fails with a fixed
+    // message instead of `unwrap()`.
     let priv_key = [1; 32];
-    let coin = block_on(eth_coin_from_conf_and_request(
+    let Ok(coin) = block_on(eth_coin_from_conf_and_request(
         &ctx,
         "MATIC",
         &conf,
         &request,
         &priv_key,
         CoinProtocol::ETH { chain_id: None },
-    ))
-    .unwrap();
+    )) else {
+        panic!("eth_coin_from_conf_and_request failed");
+    };
 
     // A known, immutable historical maker payment on Polygon mainnet (Dec 2021),
     // emitted in block 22_185_152. We start the scan two blocks before it with a
@@ -2897,7 +2912,7 @@ fn polygon_check_if_my_payment_sent() {
 
     let secret_hash = hex::decode("fc33114b389f0ee1212abf2867e99e89126f4860").unwrap();
     let swap_contract_address: BytesJson = "9130b257d37a52e52f21054c4da3450c72f595ce".into();
-    let my_payment = coin
+    let found = coin
         .check_if_my_payment_sent(
             1638764369,
             &[],
@@ -2906,40 +2921,77 @@ fn polygon_check_if_my_payment_sent() {
             from_block,
             &Some(swap_contract_address.clone()),
         )
-        .wait()
-        .unwrap()
-        .unwrap();
+        .wait();
+    let my_payment = match found {
+        Ok(Some(payment)) => payment,
+        Ok(None) => panic!("the known payment was not found"),
+        Err(_) => panic!("check_if_my_payment_sent failed"),
+    };
     let expected_hash = BytesJson::from("69a20008cea0c15ee483b5bbdff942752634aa072dfd2ff715fe87eec302de11");
     assert_eq!(expected_hash, my_payment.tx_hash());
 
-    // Negative case: crawl only the last several blocks for the same payment id.
-    // Its PaymentSent event is in 2021, so scanning a recent window must NOT find
-    // it — this exercises the "scanned the whole window, nothing found -> None"
-    // branch. The head is read via the alloy provider directly, NOT the coin's
-    // `current_block()` (the method the tested code uses), so the fixture stays
-    // independent of the code under test. The window is small (a handful of
-    // `logs_block_range` chunks), so it stays within free-tier getLogs limits.
+    // Undetermined case: scan only the last several blocks for the same payment id.
+    // The swap contract knows this payment (its state is not `Uninitialized`), but
+    // its PaymentSent event is in 2021, so the recent window holds no event for it.
+    // A contract state without the event is a contradiction, so the answer is
+    // undetermined (an error), never "not sent" (CRD ch.39 R39.11.5A.4). The head
+    // is read via the alloy provider directly, NOT the coin's `current_block()`
+    // (the method the tested code uses), so the fixture stays independent of the
+    // code under test. The window is small (a handful of `logs_block_range`
+    // chunks), so it stays within free-tier getLogs limits.
     let recent_head = {
         use alloy::providers::Provider as _;
-        block_on(coin.alloy_provider().get_block_number()).unwrap()
+        let Ok(head) = block_on(coin.alloy_provider().get_block_number()) else {
+            panic!("get_block_number failed");
+        };
+        head
     };
     let recent_from_block = recent_head.saturating_sub(20);
-    let not_found = coin
+    let undetermined = coin
         .check_if_my_payment_sent(
             1638764369,
             &[],
             &[],
             &secret_hash,
             recent_from_block,
-            &Some(swap_contract_address),
+            &Some(swap_contract_address.clone()),
         )
-        .wait()
-        .unwrap();
+        .wait();
+    let Err(undetermined) = undetermined else {
+        panic!("a payment the contract knows must not get an Ok answer in the recent window");
+    };
+    // The error text carries a source-location prefix, so the fixed leading phrase
+    // of the message is matched rather than the whole text. The text itself is not
+    // printed (see the note on error texts above).
     assert!(
-        not_found.is_none(),
-        "payment must not be found in the recent {}..{} window",
+        undetermined.contains("Undetermined whether the payment was sent"),
+        "a payment the contract knows must be undetermined in the recent {}..{} window",
         recent_from_block,
         recent_head
+    );
+
+    // Not-sent case: the same lock time with a secret hash whose last byte is
+    // flipped. The payment id is derived from the lock time and the secret hash,
+    // so this id differs from the known payment's and no payment was ever sent
+    // under it: the contract reports `Uninitialized`, and the answer is `None`.
+    let mut unknown_secret_hash = secret_hash.clone();
+    *unknown_secret_hash.last_mut().unwrap() ^= 0xff;
+    let not_sent = coin
+        .check_if_my_payment_sent(
+            1638764369,
+            &[],
+            &[],
+            &unknown_secret_hash,
+            recent_from_block,
+            &Some(swap_contract_address),
+        )
+        .wait();
+    let Ok(not_sent) = not_sent else {
+        panic!("check_if_my_payment_sent failed");
+    };
+    assert!(
+        not_sent.is_none(),
+        "a payment id unknown to the contract must be reported as not sent"
     );
 }
 
@@ -2957,6 +3009,7 @@ fn test_message_hash() {
     let ctx = MmCtxBuilder::new().into_mm_arc();
     let my_addr = key_pair.address();
     let coin = EthCoin(Arc::new(EthCoinImpl {
+        swap_evidence: crate::SwapEvidencePolicy::NotAdopted,
         ticker: "ETH".into(),
         coin_type: EthCoinType::Eth,
         my_address: my_addr,
@@ -2965,6 +3018,7 @@ fn test_message_hash() {
         swap_contract_address: Address::from_slice(&hex::decode("7Bc1bBDD6A0a722fC9bffC49c921B685ECB84b94").unwrap()),
         fallback_swap_contract: None,
         web3_instances: vec![Web3Instance {
+            url: String::new(),
             web3: web3.clone(),
             is_parity: true,
         }],
@@ -3014,6 +3068,7 @@ fn test_sign_verify_message() {
     let ctx = MmCtxBuilder::new().into_mm_arc();
     let my_addr = key_pair.address();
     let coin = EthCoin(Arc::new(EthCoinImpl {
+        swap_evidence: crate::SwapEvidencePolicy::NotAdopted,
         ticker: "ETH".into(),
         coin_type: EthCoinType::Eth,
         my_address: my_addr,
@@ -3022,6 +3077,7 @@ fn test_sign_verify_message() {
         swap_contract_address: Address::from_slice(&hex::decode("7Bc1bBDD6A0a722fC9bffC49c921B685ECB84b94").unwrap()),
         fallback_swap_contract: None,
         web3_instances: vec![Web3Instance {
+            url: String::new(),
             web3: web3.clone(),
             is_parity: true,
         }],
@@ -3184,7 +3240,7 @@ fn test_wei_to_gwei_roundtrip() {
 // ---------------------------------------------------------------------------
 
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
-fn trezor_eth_coin_for_test(coin_type: EthCoinType) -> (MmArc, EthCoin) {
+pub(super) fn trezor_eth_coin_for_test(coin_type: EthCoinType) -> (MmArc, EthCoin) {
     // Fixed key material only to source a stable address + public key for the
     // Trezor signer fixture; no secret is stored on the coin (CRD R50.1).
     let key_pair = KeyPair::from_secret_slice(
@@ -3211,6 +3267,7 @@ fn trezor_eth_coin_for_test(coin_type: EthCoinType) -> (MmArc, EthCoin) {
     .to_string();
 
     let eth_coin = EthCoin(Arc::new(EthCoinImpl {
+        swap_evidence: crate::SwapEvidencePolicy::NotAdopted,
         coin_type,
         decimals: 18,
         gas_station_url: None,
@@ -3231,6 +3288,7 @@ fn trezor_eth_coin_for_test(coin_type: EthCoinType) -> (MmArc, EthCoin) {
         fallback_swap_contract: None,
         ticker,
         web3_instances: vec![Web3Instance {
+            url: String::new(),
             web3: web3.clone(),
             is_parity: true,
         }],
@@ -3360,9 +3418,10 @@ fn tron_v1_sender_trade_fee_returns_error_without_network() {
     let (_ctx, coin) = trezor_eth_coin_for_test(EthCoinType::Tron);
     let err = block_on(coin.get_sender_trade_fee(TradePreimageValue::Exact(1.into()), FeeApproxStage::WithoutApprox))
         .unwrap_err();
-    assert!(
-        matches!(err.into_inner(), TradePreimageError::InternalError(msg) if msg.contains("TRON V1 sender trade fee"))
-    );
+    assert!(matches!(
+        err.into_inner(),
+        TradePreimageError::InternalError(msg) if msg.contains("not a TRON coin with a node client")
+    ));
 }
 
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
@@ -3373,7 +3432,8 @@ fn tron_v1_wait_for_tx_spend_returns_error_without_decoding() {
         .wait_for_tx_spend(&[], 0, 0, &coin.swap_contract_address())
         .wait()
         .unwrap_err();
-    assert!(matches!(err, TransactionErr::Plain(msg) if msg.contains("TRON V1 swap spend watchers")));
+    // The TRON spend watch is `tron::swap::watch`'s: a coin without a node client answers a plain error.
+    assert!(matches!(err, TransactionErr::Plain(msg) if msg.contains("not a TRON coin")));
 }
 
 fn legacy_eip155_vector_bytes() -> Vec<u8> {
@@ -3855,6 +3915,7 @@ mod swap_send_path_wire_form {
         let ctx = MmCtxBuilder::new().with_conf(conf).into_mm_arc();
         let my_address = public_to_address(&key_pair.public());
         let coin = EthCoin(Arc::new(EthCoinImpl {
+            swap_evidence: crate::SwapEvidencePolicy::NotAdopted,
             coin_type: EthCoinType::Erc20 {
                 platform: "MATIC".to_owned(),
                 token_addr,
@@ -3871,6 +3932,7 @@ mod swap_send_path_wire_form {
             fallback_swap_contract: None,
             ticker: "USDC-PLG20".to_owned(),
             web3_instances: vec![Web3Instance {
+                url: String::new(),
                 web3: web3.clone(),
                 is_parity: true,
             }],
@@ -4387,13 +4449,11 @@ mod scripted_node_ports {
             other => panic!("the scripted node does not serve `{}`", other),
         });
         // A closed loopback port stands in for the node that never answers.
-        let dead_url = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            format!("http://127.0.0.1:{}", l.local_addr().unwrap().port())
-        };
+        let dead_url = crate::closed_port::closed_url();
         let instances: Vec<Web3Instance> = [behind.url.clone(), ahead.url.clone(), dead_url]
             .into_iter()
             .map(|url| Web3Instance {
+                url: String::new(),
                 web3: crate::eth::alloy_compat::build_provider(
                     crate::node_url::listed_nodes("TEST", vec![url]),
                     vec![],
