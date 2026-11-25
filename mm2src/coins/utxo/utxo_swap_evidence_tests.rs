@@ -6,7 +6,7 @@ use crate::swap_evidence::{is_undetermined, swap_evidence_policy_from, SwapEvide
 use crate::utxo::bch::bch_coin_over_fields_for_test;
 use crate::utxo::qtum::QtumCoin;
 use crate::utxo::rpc_clients::electrum_stub_server::{StubBehavior, StubServer};
-use crate::utxo::utxo_common::{dhash160, evidence_nodes, payment_script, EvidenceNodes};
+use crate::utxo::utxo_common::{self, dhash160, evidence_nodes, payment_script, EvidenceNodes};
 use crate::utxo::utxo_standard::{utxo_standard_coin_with_priv_key, UtxoStandardCoin};
 use crate::utxo::utxo_tests::{electrum_client_for_test, utxo_coin_fields_for_test, utxo_coin_from_fields};
 use crate::{CanRefundHtlc, FoundSwapTxSpend, MarketCoinOps, SwapOps, ValidatePaymentInput};
@@ -17,22 +17,29 @@ use mm2_core::mm_ctx::MmCtxBuilder;
 use script::{Builder, Opcode};
 use serialization::serialize;
 
-const TIME_LOCK: u32 = 100_000;
-const SECRET: [u8; 32] = [7; 32];
+pub(crate) const TIME_LOCK: u32 = 100_000;
+pub(crate) const SECRET: [u8; 32] = [7; 32];
 const HOSTS: [&str; 3] = ["127.0.0.1", "127.0.0.2", "127.0.0.3"];
 
 /// The two keys, the swap's secret hash, and the transactions of one swap payment.
-struct Swap {
-    my_pub: Vec<u8>,
-    other_pub: Vec<u8>,
-    secret_hash: Vec<u8>,
-    payment: UtxoTx,
+pub(crate) struct Swap {
+    pub(crate) my_pub: Vec<u8>,
+    pub(crate) other_pub: Vec<u8>,
+    pub(crate) secret_hash: Vec<u8>,
+    pub(crate) payment: UtxoTx,
+    /// The index of the HTLC output in the payment: 0 for a plain UTXO payment, 1 for an SLP one.
+    htlc_vout: usize,
 }
 
-fn txid_hex(tx: &UtxoTx) -> String { format!("{:?}", tx.hash().reversed()) }
+pub(crate) fn txid_hex(tx: &UtxoTx) -> String { format!("{:?}", tx.hash().reversed()) }
 
 impl Swap {
-    fn new() -> Swap {
+    pub(crate) fn new() -> Swap { Swap::with_htlc_at(0) }
+
+    /// An SLP-shaped payment (htlc_vout 1): an OP_RETURN output at 0 and the HTLC at 1.
+    pub(crate) fn slp_shaped() -> Swap { Swap::with_htlc_at(1) }
+
+    fn with_htlc_at(htlc_vout: usize) -> Swap {
         let my = KeyPair::random_compressed();
         let other = KeyPair::random_compressed();
         let secret_hash = dhash160(&SECRET).to_vec();
@@ -48,6 +55,15 @@ impl Swap {
             sequence: 0,
             script_witness: vec![],
         });
+        if htlc_vout == 1 {
+            payment.outputs.push(TransactionOutput {
+                value: 0,
+                script_pubkey: Builder::default()
+                    .push_opcode(Opcode::OP_RETURN)
+                    .push_bytes(b"SLP")
+                    .into_bytes(),
+            });
+        }
         payment.outputs.push(TransactionOutput {
             value: 100_000,
             script_pubkey: Builder::build_p2sh(&dhash160(&redeem).into()).to_bytes(),
@@ -57,10 +73,11 @@ impl Swap {
             other_pub: other.public().to_vec(),
             secret_hash,
             payment,
+            htlc_vout,
         }
     }
 
-    fn redeem(&self) -> Vec<u8> {
+    pub(crate) fn redeem(&self) -> Vec<u8> {
         payment_script(
             TIME_LOCK,
             &self.secret_hash,
@@ -71,7 +88,7 @@ impl Swap {
     }
 
     /// A spend of the payment by the secret `secret`, or by the time lock path when it is `None`.
-    fn spend(&self, secret: Option<[u8; 32]>) -> UtxoTx {
+    pub(crate) fn spend(&self, secret: Option<[u8; 32]>) -> UtxoTx {
         let script_sig = match secret {
             Some(secret) => Builder::default()
                 .push_bytes(&[1; 9])
@@ -90,7 +107,7 @@ impl Swap {
         spend.inputs.push(TransactionInput {
             previous_output: OutPoint {
                 hash: self.payment.hash(),
-                index: 0,
+                index: self.htlc_vout as u32,
             },
             script_sig,
             sequence: 0,
@@ -105,7 +122,7 @@ impl Swap {
 }
 
 /// The history of the payment's script hash a server shows: the payment, and the spend when there is one.
-fn show_history(server: &StubServer, swap: &Swap, spend: Option<&UtxoTx>) {
+pub(crate) fn show_history(server: &StubServer, swap: &Swap, spend: Option<&UtxoTx>) {
     let mut history = vec![json!({"tx_hash": txid_hex(&swap.payment), "height": 100})];
     server.set_params_result(
         "blockchain.transaction.get",
@@ -131,14 +148,14 @@ fn header_with_time(time: u32) -> String {
 }
 
 /// A chain of eleven headers ending at `tip`, every header with the time `time`.
-fn show_chain(server: &StubServer, tip: u64, time: u32) {
+pub(crate) fn show_chain(server: &StubServer, tip: u64, time: u32) {
     for height in tip - 10..=tip {
         server.set_chain_header(height, &header_with_time(time));
     }
     server.set_tip(tip);
 }
 
-async fn start_servers(count: usize) -> Vec<StubServer> {
+pub(crate) async fn start_servers(count: usize) -> Vec<StubServer> {
     let mut servers = Vec::new();
     for host in HOSTS.iter().take(count) {
         servers.push(StubServer::start_on(host, StubBehavior::Answer).await);
@@ -146,7 +163,7 @@ async fn start_servers(count: usize) -> Vec<StubServer> {
     servers
 }
 
-fn adopted_fields(servers: &[&StubServer], field: Option<&str>) -> UtxoCoinFields {
+pub(crate) fn adopted_fields(servers: &[&StubServer], field: Option<&str>) -> UtxoCoinFields {
     let addrs: Vec<String> = servers.iter().map(|server| server.addr()).collect();
     let addr_refs: Vec<&str> = addrs.iter().map(String::as_str).collect();
     // The client builder blocks on its own runtime, so it is built on a thread outside the test's runtime.
@@ -193,6 +210,44 @@ async fn search_spend<C: SwapOps>(coin: &C, swap: &Swap) -> Result<Option<FoundS
     .await
 }
 
+/// The shared search of `_my` (or `_other`, whose keys are the other way round: the payment is the other side's)
+/// at the HTLC output of the payment, as the SLP coin calls it.
+async fn search_spend_at_htlc_output(
+    coin: &UtxoStandardCoin,
+    swap: &Swap,
+    mine: bool,
+) -> Result<Option<FoundSwapTxSpend>, String> {
+    let policy = crate::MmCoin::swap_evidence_policy(coin);
+    let tx = serialize(&swap.payment).take();
+    if mine {
+        utxo_common::search_for_swap_tx_spend_my(
+            coin.as_ref(),
+            &policy,
+            TIME_LOCK,
+            &swap.my_pub,
+            &swap.other_pub,
+            &swap.secret_hash,
+            &tx,
+            swap.htlc_vout,
+            0,
+        )
+        .await
+    } else {
+        utxo_common::search_for_swap_tx_spend_other(
+            coin.as_ref(),
+            &policy,
+            TIME_LOCK,
+            &swap.other_pub,
+            &swap.my_pub,
+            &swap.secret_hash,
+            &tx,
+            swap.htlc_vout,
+            0,
+        )
+        .await
+    }
+}
+
 fn is_claimed(found: &Result<Option<FoundSwapTxSpend>, String>) -> bool {
     matches!(found, Ok(Some(FoundSwapTxSpend::Spent(_))))
 }
@@ -220,6 +275,74 @@ fn spend_two_servers_agree() {
         show_history(&servers[0], &swap, None);
         show_history(&servers[1], &swap, None);
         assert!(matches!(search_spend(&coin, &swap).await, Ok(None)));
+    });
+}
+
+/// S: an SLP-shaped payment (OP_RETURN at output 0, the HTLC at output 1) is searched at output 1: the claim and
+/// the refund are found by `_my` and `_other`, and nothing is found when nothing spent it.
+#[test]
+fn spend_of_an_slp_shaped_payment_is_found_at_output_one() {
+    block_on(async {
+        let servers = start_servers(2).await;
+        let swap = Swap::slp_shaped();
+        let claim = swap.spend(Some(SECRET));
+        show_history(&servers[0], &swap, Some(&claim));
+        show_history(&servers[1], &swap, Some(&claim));
+        let coin = utxo_coin(&[&servers[0], &servers[1]], None);
+        assert!(is_claimed(&search_spend_at_htlc_output(&coin, &swap, true).await));
+        assert!(is_claimed(&search_spend_at_htlc_output(&coin, &swap, false).await));
+
+        let refund = swap.spend(None);
+        show_history(&servers[0], &swap, Some(&refund));
+        show_history(&servers[1], &swap, Some(&refund));
+        assert!(matches!(
+            search_spend_at_htlc_output(&coin, &swap, true).await,
+            Ok(Some(FoundSwapTxSpend::Refunded(_)))
+        ));
+        assert!(matches!(
+            search_spend_at_htlc_output(&coin, &swap, false).await,
+            Ok(Some(FoundSwapTxSpend::Refunded(_)))
+        ));
+
+        show_history(&servers[0], &swap, None);
+        show_history(&servers[1], &swap, None);
+        assert!(matches!(
+            search_spend_at_htlc_output(&coin, &swap, true).await,
+            Ok(None)
+        ));
+    });
+}
+
+/// S: a wrong HTLC script at the searched output is a hard stop naming the output, for an SLP-shaped payment
+/// (output 1) and for a plain one (output 0). No server is asked for a history.
+#[test]
+fn spend_of_a_payment_with_a_wrong_htlc_script_is_a_hard_stop_naming_the_output() {
+    block_on(async {
+        let servers = start_servers(2).await;
+        let coin = utxo_coin(&[&servers[0], &servers[1]], None);
+        for htlc_vout in [0usize, 1] {
+            let mut swap = Swap::with_htlc_at(htlc_vout);
+            swap.payment.outputs[htlc_vout].script_pubkey =
+                Builder::build_p2sh(&dhash160(b"another script").into()).to_bytes();
+            show_history(&servers[0], &swap, None);
+            show_history(&servers[1], &swap, None);
+            for found in [
+                search_spend_at_htlc_output(&coin, &swap, true).await,
+                search_spend_at_htlc_output(&coin, &swap, false).await,
+            ] {
+                let error = found.expect_err("the output does not pay the HTLC");
+                assert!(
+                    error.contains(&format!("output {} does not pay the HTLC script", htlc_vout)),
+                    "{error}"
+                );
+                assert!(!is_undetermined(&error), "{error}");
+            }
+        }
+        let asked: usize = servers
+            .iter()
+            .map(|server| server.requests("blockchain.scripthash.get_history"))
+            .sum();
+        assert_eq!(asked, 0);
     });
 }
 
@@ -682,7 +805,7 @@ fn a_one_server_coin_is_refused_and_accepted_with_the_evidence_node() {
         let server = StubServer::start(StubBehavior::Answer).await;
         server.set_result("blockchain.headers.subscribe", json!({"height": 777, "hex": "00"}));
         let conf = json!({"coin": "DOC", "asset": "DOC", "rpcport": 62415});
-        let activate = |extra: Json| {
+        let activate = |extra: Json, allow: bool| {
             let conf = conf.clone();
             let addr = server.addr();
             async move {
@@ -690,17 +813,23 @@ fn a_one_server_coin_is_refused_and_accepted_with_the_evidence_node() {
                 if let Some(field) = extra.as_str() {
                     req["swap_evidence_node"] = json!(field);
                 }
-                let ctx = MmCtxBuilder::new().into_mm_arc();
+                let ctx = MmCtxBuilder::new()
+                    .with_conf(json!({ "swap_evidence_allow_single_host": allow }))
+                    .into_mm_arc();
                 let params = UtxoActivationParams::from_legacy_req(&req).unwrap();
                 utxo_standard_coin_with_priv_key(&ctx, "DOC", &conf, &params, &[1u8; 32])
                     .await
                     .unwrap()
             }
         };
-        let refused = activate(Json::Null).await;
+        // the single-host switch off: today's refusal
+        let refused = activate(Json::Null, false).await;
         let text = refused.swap_evidence_refusal().expect("one server is refused");
         assert!(text.contains("swap_evidence_node"), "{text}");
-        let accepted = activate(json!(server.addr())).await;
+        let accepted = activate(json!(server.addr()), false).await;
         assert_eq!(accepted.swap_evidence_refusal(), None);
+        // the switch on (the default): one configured host is relaxed and admitted without the field
+        let relaxed = activate(Json::Null, true).await;
+        assert_eq!(relaxed.swap_evidence_refusal(), None);
     });
 }
