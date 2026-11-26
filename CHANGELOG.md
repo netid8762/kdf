@@ -220,6 +220,20 @@ or undo, and every change that needs a step from you.
     entry for the platform ticker. A client that reads the platform ticker's balance of every listed address must
     accept an empty map. A later `account_balance` lists those addresses with the full map and zero values.
   - Detail: PR #478; CRD ch.49 R49.35, R49.36.
+- **ARRR pays a fixed 0.0001 ARRR per transaction and trades at least 0.001 ARRR; saved ARRR orders follow at
+  start-up.**
+  - *What changes:* with no `txfee` in its coin entry, ARRR pays 0.0001 ARRR (10,000 base units) for every
+    transaction, and its minimum trading volume is 0.001 ARRR in place of 0.0001 ARRR; `setprice`, `buy` and `sell`
+    below it fail with `VolumeTooLow`. Once both coins of a saved order are active after start-up, and when a
+    good-till-cancelled taker order becomes a maker order, an order with ARRR on either side whose minimum volume is
+    below 0.001 ARRR keeps trading with its minimum raised to 0.001 ARRR; one whose whole volume is below it is
+    cancelled. Each such order is named in one log line. An ARRR coin entry with `txfee: 0` or the ZIP 317 fee class
+    is refused at activation.
+  - *What to do:* nothing for the published ARRR entry. Raise any ARRR volume or minimum below 0.001 ARRR in your
+    scripts (saved orders are adjusted at start-up as above), and give an ARRR coin entry with `txfee: 0` or the ZIP
+    317 class a positive `txfee`, or remove it. A `txfee` of 1000 gives the earlier fee and a minimum of 0.0001 ARRR
+    back.
+  - Detail: PR #544; CRD ch.39 R39.6.5f (status note of 2026-11-26); the item under "Changed" / "Shielded coins".
 
 #### Coins that are no longer visible after an upgrade
 
@@ -788,6 +802,15 @@ the previous version used. The safe way:
   (default 1, lowest 1). Other `.bak` files are left alone. To go back to an older build, put the
   backup over the wallet database file as described in `RELOADED_VS_GLEEC.md`.
   Detail: PR #407; CRD ch.39 R39.8.0bc, T39.8.0j.
+- **ARRR pays one fixed fee of 0.0001 ARRR (10,000 base units) for every transaction, the fees shown before a trade
+  are that fee, and its minimum trading volume is 0.001 ARRR.** With no `txfee` in its coin entry (the published
+  ARRR entry has none), a shielded coin pays 10,000 base units for a withdrawal, a swap payment, the DEX fee, and
+  the spend and refund of a swap payment, in place of 1,000; `trade_preimage` and the swap figures report the same
+  10,000 (the receiver fee was 496 before), so what a trade is quoted equals what it pays. The minimum trading
+  volume, and the default minimum volume of a new order, is ten times that fee: 0.001 ARRR in place of 0.0001 ARRR.
+  A `txfee` in the coin entry still sets the fee and scales the minimum; an entry with `txfee: 0` or the ZIP 317 fee
+  class is refused at activation. Other UTXO coins keep their default. Detail: PR #544; CRD ch.39 R39.6.5f (status
+  note of 2026-11-26).
 
 #### Tendermint (Cosmos) coins
 
@@ -968,6 +991,20 @@ the previous version used. The safe way:
   a passing error on every coin family and searches again after 30 seconds. On EVM coins the value read from the
   spend of the taker payment is used as the secret only when its hash equals the swap's secret hash.
   - Detail: PR #532; CRD ch.52 R18, R19, R32, R33 and their status notes of 2026-11-23, ch.51 §51.6G R100.
+- **A v2 swap waits when a chain read it rests on is undetermined, and neither refunds nor claims on it.** This
+  holds for the maker's search for the spend of the taker funding, the maker's and the taker's reads of the other
+  side's payment confirmations, the taker's search for the spend of the taker payment, and the refundability check
+  of both sides. An undetermined read is read again at the step's poll interval; it is never taken as "nothing
+  found", "not spent", "not confirmed" or "refundable". The wait lasts until 3700 seconds past the lock time of the
+  node's own payment (for the taker's read of the maker payment's confirmations: of its funding), and at least 3700
+  seconds from the first undetermined read at or after that lock time (a restart starts the wait anew). A read that
+  follows an undetermined one asks the nodes again also after the step's own deadline; a confirmation, or a spend
+  of the taker funding, that is read only then is not acted on and the step takes its refund path. When the
+  wait ends while the read is still undetermined, the swap ends as aborted, with a reason whose text names the read,
+  the coin and the fix: add a server on a second host to the coin's node list or set `swap_evidence_node`, then run
+  `recover_funds_of_swap`. The log has one warning per wait. A read that fails
+  in another way is handled as the step's own rule says.
+  - Detail: PR #533; CRD ch.52 R18, R19, R21, R30, R31, R34 and their status notes of 2026-11-24, ch.51 §51.6G R100.
 
 ### Fixed
 
@@ -1409,6 +1446,19 @@ the previous version used. The safe way:
   status notes of 2026-11-23 after the description of the maker's validation stage, after R28 and at the end of
   §51.6C; ch.09, status note of 2026-11-23 after §9.6.
 
+#### Shielded coins
+
+- **ARRR can spend the notes on the wallet's change address, and the balance it shows can be
+  spent.** In Light mode, ARRR notes on the wallet's change address (the internal address of the
+  same seed), such as the change that a Pirate wallet on the same seed makes, are now spent like any
+  other note: a withdrawal, a withdrawal to a `pirate1` address and a swap payment can use them. A
+  shielded spend signs each note with the key of the ZIP-32 scope the note belongs to. `my_balance`
+  counts these notes as before, and the amount it shows can now be spent: a withdrawal of the
+  maximum spends exactly that balance. KDF Reloaded's own change goes to the wallet's external `zs1`
+  address and was not affected. Nothing needs to be done: no rescan and no new activation, since the
+  wallet database already holds these notes. Detail: PR #542; CRD ch.39 R39.8.0ag1 (status note of
+  2026-11-25).
+
 ### Tests
 
 - **A Tendermint history test no longer hangs when the whole `coins` test suite runs in parallel.** Once a test
@@ -1655,6 +1705,44 @@ the previous version used. The safe way:
   Siacoin is the only coin that does, so no swap hands its data to a watcher, as the 0.4.0-beta.1 item "The swap
   watcher does not work yet" says. Keep your node running until your swaps have finished. Detail: CRD ch.09 R17,
   ch.20 D7.
+- **KDF Reloaded neither shows nor spends ARRR funds held in the Ironwood pool.** The Ironwood pool
+  is Pirate Chain's newer shielded pool. Funds there, for example funds a Pirate wallet on the same
+  seed keeps in it, stay safe and can be spent from that Pirate wallet; the balance KDF Reloaded
+  shows covers the Sapling part only. A coin in native mode is still refused at activation.
+
+## [0.4.2-beta.1] — 2026-11-26
+
+### Changed
+
+#### Transport, TLS and dependencies
+
+- **The URL library moved to 2.5.9, which clears RUSTSEC-2026-0592.** The `url` crate moved from
+  2.5.8 to 2.5.9, and `form_urlencoded`, which the new version requires, from 1.2.2 to 1.2.3. KDF
+  Reloaded's own code does not call the affected function. The dependency policy needs no exception
+  for this advisory. Detail: PR #545, the release-line port of PR #492.
+
+### Fixed
+
+#### Shielded coins (ARRR)
+
+- **ARRR can spend the notes on the wallet's change address, and the balance it shows can be
+  spent.** In Light mode, ARRR notes on the wallet's change address (the internal address of the
+  same seed), such as the change that a Pirate wallet on the same seed makes, are now spent like any
+  other note: a withdrawal, a withdrawal to a `pirate1` address and a swap payment can use them. A
+  shielded spend signs each note with the key of the ZIP-32 scope the note belongs to. `my_balance`
+  counts these notes as before, and the amount it shows can now be spent: a withdrawal of the
+  maximum spends exactly that balance. KDF Reloaded's own change goes to the wallet's external `zs1`
+  address and was not affected. Nothing needs to be done: no rescan and no new activation, since the
+  wallet database already holds these notes. Detail: PR #541; CRD ch.39 R39.8.0ag1 (status note of
+  2026-11-25).
+
+### Known limitations
+
+- **KDF Reloaded neither shows nor spends ARRR funds held in the Ironwood pool.** The Ironwood pool
+  is Pirate Chain's newer shielded pool. Funds there, for example funds a Pirate wallet on the same
+  seed keeps in it, stay safe and can be spent from that Pirate wallet; the balance KDF Reloaded
+  shows covers the Sapling part only. A coin in native mode is refused at activation in this
+  release, as before.
 
 ## [0.4.1-beta.1] — 2026-11-21
 
