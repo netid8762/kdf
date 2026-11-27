@@ -433,6 +433,20 @@ pub struct Undetermined {
 /// [`is_undetermined`]).
 pub const UNDETERMINED_PREFIX: &str = "swap evidence undetermined: ";
 
+/// The fixed reason of a confirmation wait whose last read did not reach a node.
+const CONFIRMATION_READ_FAILED: &str = "the read of the confirmations failed";
+
+/// The text a confirmation wait appends to its "waited too long" error when the last read of the wait did not reach
+/// a node (`last_read_failed`): a read that failed is undetermined, never "not confirmed". Empty when the last read
+/// was answered. It carries no text of a node.
+pub fn read_failed_suffix(last_read_failed: bool) -> String {
+    if last_read_failed {
+        format!("; {}", undetermined(CONFIRMATION_READ_FAILED, &[]))
+    } else {
+        String::new()
+    }
+}
+
 /// The only constructor of the error text of an undetermined read: [`UNDETERMINED_PREFIX`], the `reason` and the
 /// node labels (`host[:port]` forms, see [`node_name`], never URLs).
 pub fn undetermined(reason: &str, nodes: &[&str]) -> String {
@@ -447,6 +461,19 @@ pub fn undetermined(reason: &str, nodes: &[&str]) -> String {
 /// `try_s!` and `ERR!` put a `file:line]` in front of it. It matches the prefix anywhere, so a lower-layer error
 /// that quotes it counts as undetermined; that errs toward waiting, the safe side.
 pub fn is_undetermined(err: &str) -> bool { err.contains(UNDETERMINED_PREFIX) }
+
+/// The start of the error text of a confirmation wait whose transaction was mined but failed (an EVM receipt with
+/// a failed status), the one marker the engine matches on (see [`is_mined_and_failed`]). Only a coin whose mined
+/// transactions can fail writes it; a UTXO coin never does.
+pub const MINED_AND_FAILED_PREFIX: &str = "transaction mined but failed: ";
+
+/// The only constructor of the error text of a mined transaction that failed: [`MINED_AND_FAILED_PREFIX`] and the
+/// transaction hash.
+pub fn mined_and_failed(tx_hash: &str) -> String { format!("{MINED_AND_FAILED_PREFIX}{tx_hash}") }
+
+/// The only test of an error text for a mined transaction that failed. Like [`is_undetermined`] it looks for the
+/// prefix anywhere in the text, because `ERR!` puts a `file:line]` in front of it.
+pub fn is_mined_and_failed(err: &str) -> bool { err.contains(MINED_AND_FAILED_PREFIX) }
 
 impl UndeterminedReason {
     /// Every reason. A new variant fails to compile in [`Self::phrase`] and in the match of the test
